@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //|  XAUUSD GRID - MULTI FREEZE / MULTI BASKET ENGINE (NO HEDGE)     |
-//|  Freeze active basket at -SwitchLossUSD, open new opposite basket |
-//|  Frozen baskets can close at TP or SL independently              |
+//|  Production Hardened v8.5                                         |
+//|  Protections: MaxTotalLots + MaxBaskets + Equity DD guard         |
+//|  Additions: Restart Recovery + Close Retry + MaxTotalTrades cap   |
 //+------------------------------------------------------------------+
 #property strict
 
@@ -14,19 +15,26 @@ input ulong  MagicNumber              = 26052501;
 //---------------- GRID ----------------//
 input double LotSize                  = 0.02;
 input int    GridDistancePoints       = 200;
-input int    MaxTradesPerBasket       = 50;
+input int    MaxTradesPerBasket       = 25;     // recommended for $1000
 
 //---------------- BASKET RULES --------//
-input double GridTakeProfitUSD        = 10.0;    // TP per basket (active or frozen)
-input double SwitchLossUSD            = 100.0;   // Freeze threshold for ACTIVE basket
-input double FrozenStopLossUSD        = 300.0;   // Hard SL for FROZEN baskets
+input double GridTakeProfitUSD        = 10.0;   // TP per basket (active or frozen)
+input double SwitchLossUSD            = 100.0;  // Freeze threshold for ACTIVE basket
+input double FrozenStopLossUSD        = 300.0;  // Hard SL for FROZEN baskets
 
-//---------------- MULTI BASKET SAFETY -//
-input int    MaxBaskets               = 6;       // max alive baskets (active + frozen)
-input bool   CloseOldestFrozenIfFull  = true;    // if full, close oldest frozen to allow new active
+//---------------- KEY PROTECTIONS -----//
+input int    MaxBaskets               = 4;      // protection #2
+input bool   CloseOldestFrozenIfFull  = false;  // safer default
+
+input double MaxTotalLots             = 2.0;    // protection #1 (global lots cap)
+input int    MaxTotalTrades           = 80;     // NEW: global positions cap (protection #3b)
+input double MaxEquityDrawdownPercent = 20.0;   // protection #3
+
+// Optional: when DD is breached, also block adding trades (safer)
+input bool   BlockNewTradesOnDrawdown = true;
 
 //---------------- SAFETY --------------//
-input double StopTradingBalance       = 1100.0;
+input double StopTradingBalance       = 1100.0; // stops NEW trading if BAL >= this
 input int    MaxSpreadPoints          = 80;
 input double MinMarginLevel           = 250.0;
 input int    TradeCooldownSeconds     = 3;
@@ -37,54 +45,31 @@ input int    ShockMovePoints          = 600;
 input int    ShockTimeWindowSeconds   = 60;
 input int    ShockPauseMinutes        = 30;
 
+//---------------- EXECUTION HARDENING -//
+input int    CloseRetryAttempts       = 4;      // NEW: close retry count
+input int    CloseRetryDelayMs        = 250;    // NEW: delay between retries (ms)
+
 //========================= GLOBALS =================================//
 
 // Basket direction: 0=BUY, 1=SELL
 struct Basket
 {
-   int    id;
-   int    dir;
-   bool   alive;
-   bool   frozen;
+   int      id;
+   int      dir;
+   bool     alive;
+   bool     frozen;
    datetime created;
 };
 
-Basket baskets[];           // dynamic array sized to MaxBaskets
-int    activeIdx = -1;
-int    nextBasketId = 0;
+Basket baskets[];     // sized to MaxBaskets
+int    activeIdx      = -1;
+int    nextBasketId   = 0;
 
 datetime PauseTradingUntil = 0;
 datetime lastTradeTime = 0;
 
 datetime shockStartTime = 0;
 double   shockStartPrice = 0.0;
-
-//+------------------------------------------------------------------+
-//| INIT                                                             |
-//+------------------------------------------------------------------+
-int OnInit()
-{
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(20);
-   trade.SetTypeFillingBySymbol(_Symbol);
-
-   ArrayResize(baskets, MaxBaskets);
-   for(int i=0;i<MaxBaskets;i++)
-   {
-      baskets[i].alive=false;
-      baskets[i].frozen=false;
-      baskets[i].id=-1;
-      baskets[i].dir=0;
-      baskets[i].created=0;
-   }
-
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   shockStartPrice = (ask + bid) * 0.5;
-   shockStartTime  = TimeCurrent();
-
-   return(INIT_SUCCEEDED);
-}
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -100,6 +85,13 @@ double NormalizeLot(double lot)
 
    lot = MathFloor(lot/step)*step;
    return NormalizeDouble(lot,2);
+}
+
+bool IsOurPosition()
+{
+   if(PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+   if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber) return false;
+   return true;
 }
 
 bool SpreadOK()
@@ -119,6 +111,7 @@ bool MarginOK()
 
 bool AllowTrading()
 {
+   // Keeping your original interpretation: stop NEW trading when Balance reaches cap
    if(AccountInfoDouble(ACCOUNT_BALANCE) >= StopTradingBalance)
       return false;
    return true;
@@ -129,16 +122,89 @@ bool CooldownOK()
    return ((TimeCurrent() - lastTradeTime) >= TradeCooldownSeconds);
 }
 
-bool IsOurPosition()
+double TotalLotsOpen()
 {
-   if(PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
-   if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber) return false;
+   double lots=0.0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(!IsOurPosition()) continue;
+      lots += PositionGetDouble(POSITION_VOLUME);
+   }
+   return lots;
+}
+
+int TotalTradesOpen()
+{
+   int cnt=0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(!IsOurPosition()) continue;
+      cnt++;
+   }
+   return cnt;
+}
+
+double EquityDrawdownPercent()
+{
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(bal <= 0.0) return 0.0;
+   double dd = (bal - eq) / bal * 100.0;
+   if(dd < 0) dd = 0;
+   return dd;
+}
+
+bool DrawdownBreached()
+{
+   return (EquityDrawdownPercent() >= MaxEquityDrawdownPercent);
+}
+
+bool TradeCapsOK()
+{
+   if(TotalTradesOpen() >= MaxTotalTrades) return false;
    return true;
+}
+
+// Check if we can open a new trade respecting MaxTotalLots and MaxTotalTrades.
+// Returns the lot that will be used (clamped to remaining room).
+bool GetAllowedLot(double requested, double &lotToUse)
+{
+   lotToUse = 0.0;
+
+   if(!TradeCapsOK())
+      return false;
+
+   double remaining = MaxTotalLots - TotalLotsOpen();
+   if(remaining <= 0.0) return false;
+
+   double candidate = MathMin(requested, remaining);
+   candidate = NormalizeLot(candidate);
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(candidate < minLot) return false;
+
+   lotToUse = candidate;
+   return true;
+}
+
+string BasketCommentById(const int id)
+{
+   return "B" + IntegerToString(id);
 }
 
 string BasketComment(const int idx)
 {
-   return "B" + IntegerToString(baskets[idx].id);
+   return BasketCommentById(baskets[idx].id);
+}
+
+bool IsBasketPositionById(const int basketId)
+{
+   if(!IsOurPosition()) return false;
+   return (PositionGetString(POSITION_COMMENT) == BasketCommentById(basketId));
 }
 
 bool IsBasketPosition(const int idx)
@@ -157,12 +223,13 @@ int FindFreeBasketSlot()
 
 int FindOldestFrozenBasket()
 {
-   datetime oldest = 0;
-   int idx = -1;
+   datetime oldest=0;
+   int idx=-1;
    for(int i=0;i<MaxBaskets;i++)
    {
       if(!baskets[i].alive)  continue;
       if(!baskets[i].frozen) continue;
+
       if(idx==-1 || baskets[i].created < oldest)
       {
          idx=i;
@@ -170,47 +237,6 @@ int FindOldestFrozenBasket()
       }
    }
    return idx;
-}
-
-int CreateBasket(const int dir)
-{
-   int slot = FindFreeBasketSlot();
-   if(slot == -1)
-   {
-      if(CloseOldestFrozenIfFull)
-      {
-         int old = FindOldestFrozenBasket();
-         if(old != -1)
-         {
-            // close oldest frozen to free slot
-            // (closing doesn't require spread/cooldown)
-            for(int p=PositionsTotal()-1;p>=0;p--)
-            {
-               ulong ticket=PositionGetTicket(p);
-               if(!PositionSelectByTicket(ticket)) continue;
-               if(!IsBasketPosition(old)) continue;
-               trade.PositionClose(ticket);
-            }
-
-            // mark as dead if flat
-            baskets[old].alive=false;
-            baskets[old].frozen=false;
-            baskets[old].id=-1;
-
-            slot = old; // reuse that slot
-         }
-      }
-   }
-
-   if(slot == -1) return -1;
-
-   baskets[slot].alive=true;
-   baskets[slot].frozen=false;
-   baskets[slot].dir=dir;
-   baskets[slot].id=nextBasketId++;
-   baskets[slot].created=TimeCurrent();
-
-   return slot;
 }
 
 int CountBasketPositions(const int idx)
@@ -233,6 +259,7 @@ double BasketProfit(const int idx)
       ulong ticket=PositionGetTicket(i);
       if(!PositionSelectByTicket(ticket)) continue;
       if(!IsBasketPosition(idx)) continue;
+
       profit += PositionGetDouble(POSITION_PROFIT);
       profit += PositionGetDouble(POSITION_SWAP);
    }
@@ -259,13 +286,118 @@ double BasketOuterPrice(const int idx)
       }
       else
       {
-         if(baskets[idx].dir==0 && p < price) price=p; // BUY outermost lowest
-         if(baskets[idx].dir==1 && p > price) price=p; // SELL outermost highest
+         if(baskets[idx].dir==0 && p < price) price=p; // BUY: lowest
+         if(baskets[idx].dir==1 && p > price) price=p; // SELL: highest
       }
    }
    return price;
 }
 
+//+------------------------------------------------------------------+
+//| Execution Hardened Close                                         |
+//+------------------------------------------------------------------+
+bool ClosePositionRetry(const ulong ticket)
+{
+   for(int a=1; a<=CloseRetryAttempts; a++)
+   {
+      if(trade.PositionClose(ticket))
+         return true;
+
+      int rc = (int)trade.ResultRetcode();
+      string msg = trade.ResultRetcodeDescription();
+
+      Print("Close failed (attempt ", a, "/", CloseRetryAttempts,
+            ") ticket=", ticket, " retcode=", rc, " ", msg);
+
+      Sleep(CloseRetryDelayMs);
+   }
+   return false;
+}
+
+// Close all positions belonging to a basket
+void CloseBasket(const int idx)
+{
+   bool any=false;
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(!IsBasketPosition(idx)) continue;
+
+      any=true;
+      ClosePositionRetry(ticket);
+   }
+
+   // Mark dead only when truly flat
+   if(any && CountBasketPositions(idx)==0)
+   {
+      baskets[idx].alive=false;
+      baskets[idx].frozen=false;
+      baskets[idx].id=-1;
+      baskets[idx].created=0;
+   }
+   else if(!any)
+   {
+      // no positions found; treat as dead
+      baskets[idx].alive=false;
+      baskets[idx].frozen=false;
+      baskets[idx].id=-1;
+      baskets[idx].created=0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Create basket (blocks spawning when DD breached)                  |
+//+------------------------------------------------------------------+
+int CreateBasket(const int dir)
+{
+   // Block new baskets if drawdown breached
+   if(DrawdownBreached())
+   {
+      Print("RISK GUARD: DD breached (", DoubleToString(EquityDrawdownPercent(),2),
+            "%). New baskets blocked.");
+      return -1;
+   }
+
+   int slot = FindFreeBasketSlot();
+
+   if(slot == -1)
+   {
+      // MaxBaskets enforced
+      if(CloseOldestFrozenIfFull)
+      {
+         int old = FindOldestFrozenBasket();
+         if(old != -1)
+         {
+            Print("MaxBaskets reached -> closing oldest frozen to free slot: ",
+                  BasketComment(old));
+            CloseBasket(old);
+
+            if(!baskets[old].alive)
+               slot = old;
+         }
+      }
+   }
+
+   if(slot == -1)
+   {
+      Print("RISK GUARD: MaxBaskets reached. New basket not created.");
+      return -1;
+   }
+
+   baskets[slot].alive=true;
+   baskets[slot].frozen=false;
+   baskets[slot].dir=dir;
+   baskets[slot].id=nextBasketId++;
+   baskets[slot].created=TimeCurrent();
+
+   return slot;
+}
+
+//+------------------------------------------------------------------+
+//| Open first trade (respects MaxTotalLots + MaxTotalTrades + DD)    |
+//+------------------------------------------------------------------+
 bool OpenFirstTrade(const int idx)
 {
    if(!AllowTrading()) return false;
@@ -273,29 +405,55 @@ bool OpenFirstTrade(const int idx)
    if(!MarginOK())     return false;
    if(!CooldownOK())   return false;
 
+   if(BlockNewTradesOnDrawdown && DrawdownBreached())
+   {
+      Print("RISK GUARD: DD breached (", DoubleToString(EquityDrawdownPercent(),2),
+            "%). New trades blocked.");
+      return false;
+   }
+
+   double lotToUse=0.0;
+   if(!GetAllowedLot(LotSize, lotToUse))
+   {
+      Print("RISK GUARD: MaxTotalLots/MaxTotalTrades cap reached. New trade blocked.");
+      return false;
+   }
+
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
 
    bool ok=false;
-   double lot=NormalizeLot(LotSize);
    string c=BasketComment(idx);
 
-   if(baskets[idx].dir==0) ok=trade.Buy(lot,_Symbol,ask,0,0,c);
-   else                    ok=trade.Sell(lot,_Symbol,bid,0,0,c);
+   if(baskets[idx].dir==0) ok=trade.Buy(lotToUse,_Symbol,ask,0,0,c);
+   else                    ok=trade.Sell(lotToUse,_Symbol,bid,0,0,c);
 
-   if(ok) lastTradeTime=TimeCurrent();
-   return ok;
+   if(!ok)
+   {
+      Print("OpenFirstTrade failed retcode=", (int)trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   lastTradeTime=TimeCurrent();
+   return true;
 }
 
+//+------------------------------------------------------------------+
+//| Manage ACTIVE basket grid adds (respects caps + DD)               |
+//+------------------------------------------------------------------+
 void ManageActiveBasketGrid()
 {
    if(activeIdx < 0) return;
-   if(!baskets[activeIdx].alive) return;
+   if(!baskets[activeIdx].alive)  return;
    if(baskets[activeIdx].frozen) return;
 
    if(!SpreadOK())   return;
    if(!MarginOK())   return;
    if(!CooldownOK()) return;
+
+   if(BlockNewTradesOnDrawdown && DrawdownBreached())
+      return;
 
    int count = CountBasketPositions(activeIdx);
    if(count<=0)
@@ -305,62 +463,54 @@ void ManageActiveBasketGrid()
    }
    if(count >= MaxTradesPerBasket) return;
 
+   double outer = BasketOuterPrice(activeIdx);
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
 
-   double outer = BasketOuterPrice(activeIdx);
+   double dist = 0.0;
+   if(baskets[activeIdx].dir==0) dist = (outer - bid)/_Point;  // BUY
+   else                          dist = (ask - outer)/_Point;  // SELL
 
-   if(baskets[activeIdx].dir==0) // BUY
+   if(dist < GridDistancePoints) return;
+
+   double lotToUse=0.0;
+   if(!GetAllowedLot(LotSize, lotToUse))
    {
-      double dist=(outer-bid)/_Point;
-      if(dist >= GridDistancePoints)
-      {
-         if(trade.Buy(NormalizeLot(LotSize),_Symbol,ask,0,0,BasketComment(activeIdx)))
-            lastTradeTime=TimeCurrent();
-      }
+      Print("RISK GUARD: MaxTotalLots/MaxTotalTrades cap reached. Grid add blocked.");
+      return;
    }
-   else // SELL
+
+   bool ok=false;
+   if(baskets[activeIdx].dir==0)
+      ok = trade.Buy(lotToUse,_Symbol,ask,0,0,BasketComment(activeIdx));
+   else
+      ok = trade.Sell(lotToUse,_Symbol,bid,0,0,BasketComment(activeIdx));
+
+   if(!ok)
    {
-      double dist=(ask-outer)/_Point;
-      if(dist >= GridDistancePoints)
-      {
-         if(trade.Sell(NormalizeLot(LotSize),_Symbol,bid,0,0,BasketComment(activeIdx)))
-            lastTradeTime=TimeCurrent();
-      }
+      Print("Grid add failed retcode=", (int)trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription());
+      return;
    }
+
+   lastTradeTime=TimeCurrent();
 }
 
-void CloseBasket(const int idx)
-{
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
-      ulong ticket=PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-      if(!IsBasketPosition(idx)) continue;
-      trade.PositionClose(ticket);
-   }
-
-   // mark dead (even if some fails, it will be handled next ticks)
-   if(CountBasketPositions(idx)==0)
-   {
-      baskets[idx].alive=false;
-      baskets[idx].frozen=false;
-      baskets[idx].id=-1;
-   }
-}
-
+//+------------------------------------------------------------------+
+//| Ensure active basket exists                                      |
+//+------------------------------------------------------------------+
 void EnsureActiveExists()
 {
-   // If there is no active basket, create one (start BUY)
    if(activeIdx == -1 || !baskets[activeIdx].alive)
    {
-      int idx = CreateBasket(0);
+      int idx = CreateBasket(0); // start BUY default
       if(idx != -1)
+      {
          activeIdx = idx;
+         OpenFirstTrade(activeIdx);
+      }
    }
-
-   // Ensure it has at least one trade
-   if(activeIdx != -1 && baskets[activeIdx].alive)
+   else
    {
       if(CountBasketPositions(activeIdx)==0)
          OpenFirstTrade(activeIdx);
@@ -368,8 +518,7 @@ void EnsureActiveExists()
 }
 
 //+------------------------------------------------------------------+
-//| RULES: ACTIVE TP => close + flip + restart                        |
-//| RULES: ACTIVE loss -100 => freeze + open new opposite basket      |
+//| ACTIVE TP: close basket, flip direction, start NEW basket         |
 //+------------------------------------------------------------------+
 void CheckActiveTP_FlipRestart()
 {
@@ -387,7 +536,6 @@ void CheckActiveTP_FlipRestart()
 
       CloseBasket(activeIdx);
 
-      // If it fully closed, start a NEW active basket flipped
       if(!baskets[activeIdx].alive)
       {
          int newDir = (oldDir==0 ? 1 : 0);
@@ -397,10 +545,17 @@ void CheckActiveTP_FlipRestart()
             activeIdx = idx;
             OpenFirstTrade(activeIdx);
          }
+         else
+         {
+            activeIdx = -1; // blocked by DD/MaxBaskets
+         }
       }
    }
 }
 
+//+------------------------------------------------------------------+
+//| ACTIVE Loss: freeze at -SwitchLossUSD and spawn opposite basket   |
+//+------------------------------------------------------------------+
 void CheckActiveLoss_FreezeAndSpawnOpposite()
 {
    if(activeIdx < 0) return;
@@ -418,7 +573,6 @@ void CheckActiveLoss_FreezeAndSpawnOpposite()
 
       baskets[activeIdx].frozen = true;
 
-      // spawn new opposite active basket
       int newDir = (frozenDir==0 ? 1 : 0);
       int idx = CreateBasket(newDir);
       if(idx != -1)
@@ -428,8 +582,8 @@ void CheckActiveLoss_FreezeAndSpawnOpposite()
       }
       else
       {
-         Print("WARNING: Cannot create new basket (MaxBaskets reached).");
-         // activeIdx stays pointing to frozen basket -> trading will stall until a basket closes
+         activeIdx = -1;
+         Print("WARNING: Cannot spawn new basket (DD/MaxBaskets). Active trading paused.");
       }
    }
 }
@@ -462,7 +616,7 @@ void ManageFrozenBasketsExit()
 }
 
 //+------------------------------------------------------------------+
-//| Shock                                                            |
+//| Shock filter                                                     |
 //+------------------------------------------------------------------+
 void CheckPriceShock()
 {
@@ -493,6 +647,113 @@ void CheckPriceShock()
 }
 
 //+------------------------------------------------------------------+
+//| Restart Recovery: rebuild baskets from open positions             |
+//+------------------------------------------------------------------+
+int ParseBasketIdFromComment(const string c)
+{
+   if(StringLen(c) < 2) return -1;
+   if(StringSubstr(c,0,1) != "B") return -1;
+
+   string tail = StringSubstr(c,1);
+   // ensure numeric
+   for(int i=0;i<(int)StringLen(tail);i++)
+   {
+      ushort ch = StringGetCharacter(tail,i);
+      if(ch < '0' || ch > '9') return -1;
+   }
+   return (int)StringToInteger(tail);
+}
+
+int FindBasketSlotById(const int id)
+{
+   for(int i=0;i<MaxBaskets;i++)
+      if(baskets[i].alive && baskets[i].id == id)
+         return i;
+   return -1;
+}
+
+void ResetBasketsArray()
+{
+   ArrayResize(baskets, MaxBaskets);
+   for(int i=0;i<MaxBaskets;i++)
+   {
+      baskets[i].alive=false;
+      baskets[i].frozen=false;
+      baskets[i].id=-1;
+      baskets[i].dir=0;
+      baskets[i].created=0;
+   }
+   activeIdx = -1;
+   nextBasketId = 0;
+}
+
+void RebuildStateFromPositions()
+{
+   ResetBasketsArray();
+
+   int maxId = -1;
+
+   // First pass: discover basket IDs from comments
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(!IsOurPosition()) continue;
+
+      string c = PositionGetString(POSITION_COMMENT);
+      int id = ParseBasketIdFromComment(c);
+      if(id < 0) continue;
+
+      // create slot if not present
+      int slot = FindBasketSlotById(id);
+      if(slot == -1)
+      {
+         slot = FindFreeBasketSlot();
+         if(slot == -1)
+         {
+            Print("REBUILD WARNING: More baskets found than MaxBaskets. Increase MaxBaskets.");
+            break;
+         }
+
+         baskets[slot].alive=true;
+         baskets[slot].frozen=false; // temporary, will set later
+         baskets[slot].id=id;
+         baskets[slot].created=TimeCurrent() - 1; // unknown; approximation
+         baskets[slot].dir = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY ? 0 : 1);
+      }
+
+      if(id > maxId) maxId = id;
+   }
+
+   // Determine active basket = highest ID (most recently created in this design)
+   if(maxId >= 0)
+   {
+      // Set active = maxId basket slot
+      int a = FindBasketSlotById(maxId);
+      activeIdx = a;
+
+      // All other alive baskets become frozen
+      for(int k=0;k<MaxBaskets;k++)
+      {
+         if(!baskets[k].alive) continue;
+         if(k == activeIdx) baskets[k].frozen = false;
+         else               baskets[k].frozen = true;
+      }
+
+      nextBasketId = maxId + 1;
+
+      Print("REBUILD OK: active=", (activeIdx!=-1?BasketComment(activeIdx):"NONE"),
+            " nextBasketId=", nextBasketId);
+   }
+   else
+   {
+      // No positions => normal start
+      nextBasketId = 0;
+      activeIdx = -1;
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Dashboard                                                        |
 //+------------------------------------------------------------------+
 void Dashboard()
@@ -506,11 +767,34 @@ void Dashboard()
    }
 
    Comment(
-      "MULTI-BASKET FREEZE GRID (NO HEDGE)\n",
+      "MULTI-BASKET FREEZE GRID (NO HEDGE) v8.5\n",
       "AliveBaskets: ", alive, " | Frozen: ", frozen, "\n",
-      "ActiveIdx: ", activeIdx, (activeIdx!=-1 && baskets[activeIdx].alive ? " ("+BasketComment(activeIdx)+")" : ""), "\n",
+      "ActiveIdx: ", activeIdx, (activeIdx!=-1 && baskets[activeIdx].alive ? " ("+BasketComment(activeIdx)+")" : " (NONE)"), "\n",
+      "OpenTrades: ", TotalTradesOpen(), " / ", MaxTotalTrades, "\n",
+      "OpenLots: ", DoubleToString(TotalLotsOpen(),2), " / ", DoubleToString(MaxTotalLots,2), "\n",
+      "DD%: ", DoubleToString(EquityDrawdownPercent(),2), " / ", DoubleToString(MaxEquityDrawdownPercent,2), "\n",
       "Paused: ", (TimeCurrent()<PauseTradingUntil ? "YES":"NO")
    );
+}
+
+//+------------------------------------------------------------------+
+//| INIT                                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(20);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   shockStartPrice = (ask + bid) * 0.5;
+   shockStartTime  = TimeCurrent();
+
+   // Restart recovery
+   RebuildStateFromPositions();
+
+   return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
@@ -532,21 +816,20 @@ void OnTick()
       return;
    }
 
-   // 1) Ensure there is an active basket with at least one trade
+   // 1) Ensure active basket exists
    EnsureActiveExists();
 
-   // 2) Manage frozen basket exits (TP/SL)
+   // 2) Manage frozen exits (TP/SL)
    ManageFrozenBasketsExit();
 
-   // 3) If active basket hits TP -> close, flip, start new basket
+   // 3) Active TP -> close, flip, start new (subject to DD + MaxBaskets)
    CheckActiveTP_FlipRestart();
 
-   // 4) If active basket hits -SwitchLoss -> freeze, spawn opposite new basket
+   // 4) Active -SwitchLoss -> freeze, spawn opposite (subject to DD + MaxBaskets)
    CheckActiveLoss_FreezeAndSpawnOpposite();
 
-   // 5) Add trades only for ACTIVE (not frozen)
+   // 5) Add trades only for ACTIVE (subject to caps + DD)
    ManageActiveBasketGrid();
 
    Dashboard();
 }
-``
