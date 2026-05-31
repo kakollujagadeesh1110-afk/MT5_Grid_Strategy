@@ -1,0 +1,674 @@
+//+------------------------------------------------------------------+
+//|            XAUUSD GRID ENGINE (NO HEDGE, NO TRAILING)            |
+//|         VERSION 4c: INCREMENTAL GRID - SIMPLE                    |
+//|         - Incremental grid distance (200×N)                      |
+//|         - NO hedging                                             |
+//|         - NO trailing stop                                       |
+//|         - Fixed profit target and stop loss                      |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//========================= INPUTS ==================================//
+
+input ulong  MagicNumber              = 26052501;
+
+//---------------- GRID ----------------//
+
+input double LotSize                  = 0.02;
+input int    GridIncrementStep        = 200;    // Base increment (distance = Step × GridCount)
+input int    MaxTrades                = 50;
+
+//---------------- BASKET --------------//
+
+input double BasketProfit             = 10.0;
+input double BasketStopLoss           = -150.0; // Stop loss - closes all at this loss
+
+input int    RestartAfterHours        = 2;
+
+//---------------- SAFETY --------------//
+
+input double StopTradingBalance       = 1100.0;
+
+input int    MaxSpreadPoints          = 80;
+
+input double MinMarginLevel           = 250.0;
+
+input int    TradeCooldownSeconds     = 3;
+
+//========================= GLOBALS =================================//
+
+int currentDirection = -1;
+
+datetime PauseTradingUntil = 0;
+
+datetime lastTradeTime = 0;
+
+bool closeAllPending = false;
+bool closeAfterLoss  = false;
+
+//+------------------------------------------------------------------+
+//| INIT                                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+
+   trade.SetDeviationInPoints(20);
+
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE LOT                                                    |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+
+   double maxLot =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+
+   double step =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+
+   if(lot < minLot)
+      lot = minLot;
+
+   if(lot > maxLot)
+      lot = maxLot;
+
+   lot =
+   MathFloor(lot / step) * step;
+
+   return NormalizeDouble(lot,2);
+}
+
+//+------------------------------------------------------------------+
+//| IS OUR POSITION                                                  |
+//+------------------------------------------------------------------+
+bool IsOurPosition()
+{
+   if(PositionGetString(POSITION_SYMBOL)
+      != _Symbol)
+      return false;
+
+   if((ulong)PositionGetInteger(POSITION_MAGIC)
+      != MagicNumber)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| IS GRID POSITION                                                 |
+//+------------------------------------------------------------------+
+bool IsGridPosition()
+{
+   if(!IsOurPosition())
+      return false;
+
+   string c =
+   PositionGetString(POSITION_COMMENT);
+
+   if(c == "GridBuy"
+      || c == "GridSell")
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| SPREAD CHECK                                                     |
+//+------------------------------------------------------------------+
+bool SpreadOK()
+{
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   double spread =
+   (ask - bid) / _Point;
+
+   if(spread > MaxSpreadPoints)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MARGIN CHECK                                                     |
+//+------------------------------------------------------------------+
+bool MarginOK()
+{
+   double ml =
+   AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+
+   if(ml <= 0)
+      return true;
+
+   if(ml < MinMarginLevel)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| ALLOW TRADING                                                    |
+//+------------------------------------------------------------------+
+bool AllowTrading()
+{
+   if(AccountInfoDouble(ACCOUNT_BALANCE)
+      >= StopTradingBalance)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| COOLDOWN CHECK                                                   |
+//+------------------------------------------------------------------+
+bool CooldownOK()
+{
+   if(TimeCurrent() - lastTradeTime
+      < TradeCooldownSeconds)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL OUR POSITIONS                                              |
+//+------------------------------------------------------------------+
+int TotalOurPositions()
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsOurPosition())
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| COUNT GRID POSITIONS                                             |
+//+------------------------------------------------------------------+
+int CountGridPositions(int type)
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      if(PositionGetInteger(POSITION_TYPE)
+         == type)
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL GRID POSITIONS (both types)                                |
+//+------------------------------------------------------------------+
+int TotalGridPositions()
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsGridPosition())
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| GET GRID PROFIT                                                  |
+//+------------------------------------------------------------------+
+double GetGridProfit()
+{
+   double profit = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      profit +=
+      PositionGetDouble(POSITION_PROFIT);
+
+      profit +=
+      PositionGetDouble(POSITION_SWAP);
+   }
+
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| OUTERMOST GRID PRICE                                             |
+//+------------------------------------------------------------------+
+double GetOuterGridPrice(int type)
+{
+   bool found = false;
+
+   double price = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      if(PositionGetInteger(POSITION_TYPE)
+         != type)
+         continue;
+
+      double p =
+      PositionGetDouble(POSITION_PRICE_OPEN);
+
+      if(!found)
+      {
+         found = true;
+         price = p;
+      }
+      else
+      {
+         if(type == POSITION_TYPE_BUY
+            && p < price)
+            price = p;
+
+         if(type == POSITION_TYPE_SELL
+            && p > price)
+            price = p;
+      }
+   }
+
+   return price;
+}
+
+//+------------------------------------------------------------------+
+//| GET INCREMENTAL GRID DISTANCE                                    |
+//| Distance = GridIncrementStep × CurrentGridCount                  |
+//+------------------------------------------------------------------+
+int GetIncrementalGridDistance()
+{
+   int gridCount = TotalGridPositions();
+
+   if(gridCount == 0)
+      gridCount = 1;
+
+   return GridIncrementStep * gridCount;
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE GRID WITH INCREMENTAL DISTANCE                            |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   if(!SpreadOK())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   if(!CooldownOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   // Get incremental distance based on current grid count
+   int requiredDistance = GetIncrementalGridDistance();
+
+   // BUY GRID
+
+   if(currentDirection == 0)
+   {
+      int count =
+      CountGridPositions(
+         POSITION_TYPE_BUY
+      );
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer =
+      GetOuterGridPrice(
+         POSITION_TYPE_BUY
+      );
+
+      double distance =
+      (outer - bid) / _Point;
+
+      // Use incremental distance
+      if(distance >= requiredDistance)
+      {
+         bool result =
+         trade.Buy(
+            NormalizeLot(LotSize),
+            _Symbol,
+            ask,
+            0,
+            0,
+            "GridBuy"
+         );
+
+         if(result)
+            lastTradeTime =
+            TimeCurrent();
+      }
+   }
+
+   // SELL GRID
+
+   else
+   {
+      int count =
+      CountGridPositions(
+         POSITION_TYPE_SELL
+      );
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer =
+      GetOuterGridPrice(
+         POSITION_TYPE_SELL
+      );
+
+      double distance =
+      (ask - outer) / _Point;
+
+      // Use incremental distance
+      if(distance >= requiredDistance)
+      {
+         bool result =
+         trade.Sell(
+            NormalizeLot(LotSize),
+            _Symbol,
+            bid,
+            0,
+            0,
+            "GridSell"
+         );
+
+         if(result)
+            lastTradeTime =
+            TimeCurrent();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OPEN FIRST TRADE                                                 |
+//+------------------------------------------------------------------+
+void OpenFirstTrade()
+{
+   if(!AllowTrading())
+      return;
+
+   if(!SpreadOK())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   if(currentDirection == -1)
+      currentDirection = 0;
+
+   bool result = false;
+
+   if(currentDirection == 0)
+   {
+      result =
+      trade.Buy(
+         NormalizeLot(LotSize),
+         _Symbol,
+         ask,
+         0,
+         0,
+         "GridBuy"
+      );
+   }
+   else
+   {
+      result =
+      trade.Sell(
+         NormalizeLot(LotSize),
+         _Symbol,
+         bid,
+         0,
+         0,
+         "GridSell"
+      );
+   }
+
+   if(result)
+      lastTradeTime = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| REQUEST CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void RequestCloseAll(bool lossMode)
+{
+   closeAllPending = true;
+
+   closeAfterLoss = lossMode;
+}
+
+//+------------------------------------------------------------------+
+//| PROCESS CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void ProcessCloseAll()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsOurPosition())
+         continue;
+
+      trade.PositionClose(ticket);
+   }
+
+   if(TotalOurPositions() == 0)
+   {
+      if(currentDirection == 0)
+         currentDirection = 1;
+      else
+         currentDirection = 0;
+
+      if(closeAfterLoss)
+      {
+         PauseTradingUntil =
+         TimeCurrent()
+         + (RestartAfterHours * 3600);
+      }
+
+      closeAllPending = false;
+
+      closeAfterLoss = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD                                                        |
+//+------------------------------------------------------------------+
+void Dashboard()
+{
+   double gridProfit =
+   GetGridProfit();
+
+   int gridCount = TotalGridPositions();
+   int nextDistance = GetIncrementalGridDistance();
+
+   Comment(
+      "GRID V4c (Incremental - NO HEDGE, NO TRAILING)\n",
+
+      "\n--- INCREMENTAL GRID ---",
+
+      "\nGrid Positions: ",
+      IntegerToString(gridCount),
+
+      "\nNext Grid Distance: ",
+      IntegerToString(nextDistance),
+      " pts",
+
+      "\nIncrement Step: ",
+      IntegerToString(GridIncrementStep),
+
+      "\n\n--- PROFIT/LOSS ---",
+
+      "\nGrid Floating P/L: ",
+      DoubleToString(gridProfit,2),
+
+      "\n\n--- TARGETS ---",
+
+      "\nProfit Target: ",
+      DoubleToString(BasketProfit,2),
+
+      "\nStop Loss: ",
+      DoubleToString(BasketStopLoss,2),
+
+      "\n\n--- STATUS ---",
+
+      "\nDirection: ",
+      (currentDirection == 0)
+      ? "BUY"
+      : "SELL",
+
+      "\nPaused: ",
+      (PauseTradingUntil > 0 && TimeCurrent() < PauseTradingUntil)
+      ? "YES"
+      : "NO"
+   );
+}
+
+//+------------------------------------------------------------------+
+//| ON TICK                                                          |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(closeAllPending)
+   {
+      ProcessCloseAll();
+
+      Dashboard();
+
+      return;
+   }
+
+   if(PauseTradingUntil > 0
+      && TimeCurrent() < PauseTradingUntil)
+   {
+      Dashboard();
+
+      return;
+   }
+
+   if(!AllowTrading())
+   {
+      Dashboard();
+
+      return;
+   }
+
+   // NO POSITIONS
+
+   if(TotalOurPositions() == 0)
+   {
+      OpenFirstTrade();
+
+      Dashboard();
+
+      return;
+   }
+
+   // CHECK PROFIT TARGET
+
+   double gridProfit = GetGridProfit();
+
+   if(gridProfit >= BasketProfit)
+   {
+      RequestCloseAll(false);
+
+      Dashboard();
+
+      return;
+   }
+
+   // CHECK STOP LOSS
+
+   if(gridProfit <= BasketStopLoss)
+   {
+      RequestCloseAll(true);  // Close with loss mode (will pause)
+
+      Dashboard();
+
+      return;
+   }
+
+   // MANAGE GRID
+
+   ManageGrid();
+
+   Dashboard();
+}
+//+------------------------------------------------------------------+
