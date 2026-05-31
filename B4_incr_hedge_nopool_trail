@@ -719,9 +719,12 @@ void OnTick()
    // Check grid trailing stop (only when hedge NOT triggered)
    if(CheckGridTrailingStop()) { RequestCloseAll(false); Dashboard(); return; }
 
-   // Recovery close (NO profit pooling)
-   double recoveryValue = GetTotalProfit() - realizedHedgeLoss;
-   if(recoveryValue >= BasketProfit) { RequestCloseAll(false); }
+   // Recovery close - ONLY when hedge triggered (profit target only for hedge mode)
+   if(hedgeTriggeredThisCycle)
+   {
+      double recoveryValue = GetTotalProfit() - realizedHedgeLoss;
+      if(recoveryValue >= BasketProfit) { RequestCloseAll(false); Dashboard(); return; }
+   }
 
    // Loss limit check
    double gridFloating = GetGridProfit();
