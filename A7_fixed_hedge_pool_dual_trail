@@ -1241,16 +1241,9 @@ void OnTick()
    }
    else
    {
+      // NO HEDGE: Use ONLY grid trailing stop (not profit target)
+      // Profit target only applies when hedge is triggered
       if(CheckGridTrailingStop())
-      {
-         RequestCloseAll(false);
-
-         Dashboard();
-
-         return;
-      }
-
-      if(trueRecovery >= BasketProfit)
       {
          RequestCloseAll(false);
 
