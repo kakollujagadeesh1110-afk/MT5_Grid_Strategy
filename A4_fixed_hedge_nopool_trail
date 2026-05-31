@@ -1201,15 +1201,22 @@ void OnTick()
       return;
    }
 
-   // RECOVERY CLOSE (fixed target)
+   // RECOVERY CLOSE - ONLY when hedge triggered (profit target only for hedge mode)
 
-   double recoveryValue =
-   GetTotalProfit()
-   - realizedHedgeLoss;
-
-   if(recoveryValue >= BasketProfit)
+   if(hedgeTriggeredThisCycle)
    {
-      RequestCloseAll(false);
+      double recoveryValue =
+      GetTotalProfit()
+      - realizedHedgeLoss;
+
+      if(recoveryValue >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
    }
 
    // IMPORTANT FIX:
