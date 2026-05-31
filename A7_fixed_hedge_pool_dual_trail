@@ -1,0 +1,1293 @@
+//+------------------------------------------------------------------+
+//|  A7: FIXED GRID - HEDGE - POOL - DUAL TRAILING                   |
+//|  Full featured with PROFIT and LOSS trailing for hedge           |
+//|  - Fixed 200pt grid                                              |
+//|  - Hedge protection with profit pooling                          |
+//|  - Grid trailing stop                                            |
+//|  - NEW: Hedge PROFIT trailing (locks gains)                      |
+//|  - NEW: Hedge LOSS trailing (limits damage on recovery)          |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//========================= INPUTS ==================================//
+
+input ulong  MagicNumber              = 26052501;
+
+//---------------- GRID ----------------//
+
+input double LotSize                  = 0.02;
+input int    GridDistancePoints       = 200;
+input int    MaxTrades                = 50;
+
+//---------------- BASKET --------------//
+
+input double BasketProfit             = 10.0;
+input double BasketLossLimit          = -320.0;
+
+input int    RestartAfterHours        = 2;
+
+//---------------- GRID TRAILING STOP ----------------//
+
+input double GridTrailStart           = 20.0;   // Start trailing after this profit
+input double GridTrailStep            = 10.0;   // Close if profit drops this much from peak
+
+//---------------- HEDGE ---------------//
+
+input bool   EnableHedge              = true;
+
+input double HedgeTriggerUSD          = 150.0;
+input double HedgeLot                 = 0.05;
+
+input double HedgeFixedLossUSD        = 75.0;
+
+//--- HEDGE PROFIT TRAILING ---//
+
+input double HedgeTrailStart          = 20.0;   // Start trailing profit at this level
+input double HedgeTrailStep           = 10.0;   // Trail step for profit
+
+//--- NEW: HEDGE LOSS TRAILING ---//
+
+input double HedgeLossTrailStart      = 30.0;   // Start tracking worst loss at this level
+input double HedgeLossTrailStep       = 15.0;   // Close if improves this much from worst
+
+input int    HedgeCloseDeviation      = 500;
+
+//---------------- SAFETY --------------//
+
+input double StopTradingBalance       = 1100.0;
+
+input int    MaxSpreadPoints          = 80;
+
+input double MinMarginLevel           = 250.0;
+
+input int    TradeCooldownSeconds     = 3;
+
+//========================= GLOBALS =================================//
+
+int currentDirection = -1;
+
+double realizedHedgeLoss = 0.0;
+
+double realizedHedgeProfit = 0.0;
+
+double hedgePeakProfit = 0.0;
+
+double hedgeWorstLoss = 0.0;  // NEW: Track worst hedge loss
+
+double gridPeakProfit = 0.0;
+
+ENUM_ORDER_TYPE hedgeSignalType;
+
+datetime PauseTradingUntil = 0;
+
+double lastHedgeOpenPrice = 0.0;
+
+datetime lastTradeTime = 0;
+
+bool closeAllPending = false;
+bool closeAfterLoss  = false;
+
+//--- FLAGS FOR GRID/HEDGE CONTROL ---//
+
+bool hedgeTriggeredThisCycle = false;
+
+bool lastHedgeWasLoss = false;
+
+ENUM_ORDER_TYPE lastHedgeType;
+
+bool lossLimitHitWaitingForHedge = false;
+
+//+------------------------------------------------------------------+
+//| INIT                                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+
+   trade.SetDeviationInPoints(20);
+
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE LOT                                                    |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+
+   double maxLot =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+
+   double step =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+
+   if(lot < minLot)
+      lot = minLot;
+
+   if(lot > maxLot)
+      lot = maxLot;
+
+   lot =
+   MathFloor(lot / step) * step;
+
+   return NormalizeDouble(lot,2);
+}
+
+//+------------------------------------------------------------------+
+//| IS OUR POSITION                                                  |
+//+------------------------------------------------------------------+
+bool IsOurPosition()
+{
+   if(PositionGetString(POSITION_SYMBOL)
+      != _Symbol)
+      return false;
+
+   if((ulong)PositionGetInteger(POSITION_MAGIC)
+      != MagicNumber)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| IS GRID POSITION                                                 |
+//+------------------------------------------------------------------+
+bool IsGridPosition()
+{
+   if(!IsOurPosition())
+      return false;
+
+   string c =
+   PositionGetString(POSITION_COMMENT);
+
+   if(c == "GridBuy"
+      || c == "GridSell")
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| IS HEDGE POSITION                                                |
+//+------------------------------------------------------------------+
+bool IsHedgePosition()
+{
+   if(!IsOurPosition())
+      return false;
+
+   if(PositionGetString(POSITION_COMMENT)
+      == "HEDGE")
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| SPREAD CHECK                                                     |
+//+------------------------------------------------------------------+
+bool SpreadOK()
+{
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   double spread =
+   (ask - bid) / _Point;
+
+   if(spread > MaxSpreadPoints)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MARGIN CHECK                                                     |
+//+------------------------------------------------------------------+
+bool MarginOK()
+{
+   double ml =
+   AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+
+   if(ml <= 0)
+      return true;
+
+   if(ml < MinMarginLevel)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| ALLOW TRADING                                                    |
+//+------------------------------------------------------------------+
+bool AllowTrading()
+{
+   if(AccountInfoDouble(ACCOUNT_BALANCE)
+      >= StopTradingBalance)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| COOLDOWN CHECK                                                   |
+//+------------------------------------------------------------------+
+bool CooldownOK()
+{
+   if(TimeCurrent() - lastTradeTime
+      < TradeCooldownSeconds)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL OUR POSITIONS                                              |
+//+------------------------------------------------------------------+
+int TotalOurPositions()
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsOurPosition())
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| COUNT GRID POSITIONS                                             |
+//+------------------------------------------------------------------+
+int CountGridPositions(int type)
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      if(PositionGetInteger(POSITION_TYPE)
+         == type)
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL PROFIT                                                     |
+//+------------------------------------------------------------------+
+double GetTotalProfit()
+{
+   double profit = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsOurPosition())
+         continue;
+
+      profit +=
+      PositionGetDouble(POSITION_PROFIT);
+
+      profit +=
+      PositionGetDouble(POSITION_SWAP);
+   }
+
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| GRID PROFIT ONLY                                                 |
+//+------------------------------------------------------------------+
+double GetGridProfit()
+{
+   double profit = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      profit +=
+      PositionGetDouble(POSITION_PROFIT);
+
+      profit +=
+      PositionGetDouble(POSITION_SWAP);
+   }
+
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| TRUE RECOVERY VALUE (WITH PROFIT POOLING)                        |
+//+------------------------------------------------------------------+
+double GetTrueRecoveryValue()
+{
+   double floatingPL = GetTotalProfit();
+
+   double netRealizedHedge = realizedHedgeProfit - realizedHedgeLoss;
+
+   return floatingPL + netRealizedHedge;
+}
+
+//+------------------------------------------------------------------+
+//| HEDGE OPEN CHECK                                                 |
+//+------------------------------------------------------------------+
+bool IsHedgeOpen()
+{
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsHedgePosition())
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE ONLY GRID POSITIONS                                        |
+//+------------------------------------------------------------------+
+void CloseOnlyGridPositions()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      trade.PositionClose(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OUTERMOST GRID PRICE                                             |
+//+------------------------------------------------------------------+
+double GetOuterGridPrice(int type)
+{
+   bool found = false;
+
+   double price = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      if(PositionGetInteger(POSITION_TYPE)
+         != type)
+         continue;
+
+      double p =
+      PositionGetDouble(POSITION_PRICE_OPEN);
+
+      if(!found)
+      {
+         found = true;
+         price = p;
+      }
+      else
+      {
+         if(type == POSITION_TYPE_BUY
+            && p < price)
+            price = p;
+
+         if(type == POSITION_TYPE_SELL
+            && p > price)
+            price = p;
+      }
+   }
+
+   return price;
+}
+
+//+------------------------------------------------------------------+
+//| RESET ENGINE                                                     |
+//+------------------------------------------------------------------+
+void ResetEngine()
+{
+   realizedHedgeLoss = 0.0;
+
+   realizedHedgeProfit = 0.0;
+
+   hedgePeakProfit = 0.0;
+
+   hedgeWorstLoss = 0.0;  // NEW: Reset worst loss
+
+   gridPeakProfit = 0.0;
+
+   lastHedgeOpenPrice = 0.0;
+
+   hedgeTriggeredThisCycle = false;
+   lastHedgeWasLoss = false;
+   lossLimitHitWaitingForHedge = false;
+}
+
+//+------------------------------------------------------------------+
+//| PREPARE HEDGE                                                    |
+//+------------------------------------------------------------------+
+void PrepareHedge()
+{
+   double buyLots = 0.0;
+   double sellLots = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      double lot =
+      PositionGetDouble(POSITION_VOLUME);
+
+      if(PositionGetInteger(POSITION_TYPE)
+         == POSITION_TYPE_BUY)
+      {
+         buyLots += lot;
+      }
+      else
+      {
+         sellLots += lot;
+      }
+   }
+
+   if(buyLots > sellLots)
+      hedgeSignalType = ORDER_TYPE_SELL;
+   else
+      hedgeSignalType = ORDER_TYPE_BUY;
+}
+
+//+------------------------------------------------------------------+
+//| OPEN AUTO HEDGE                                                  |
+//+------------------------------------------------------------------+
+void OpenAutoHedge()
+{
+   if(!EnableHedge)
+      return;
+
+   if(IsHedgeOpen())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   bool result = false;
+
+   hedgePeakProfit = 0.0;
+   hedgeWorstLoss = 0.0;  // NEW: Reset on new hedge
+
+   double lot =
+   NormalizeLot(HedgeLot);
+
+   trade.SetDeviationInPoints(HedgeCloseDeviation);
+
+   if(hedgeSignalType == ORDER_TYPE_BUY)
+   {
+      result =
+      trade.Buy(
+         lot,
+         _Symbol,
+         ask,
+         0,
+         0,
+         "HEDGE"
+      );
+
+      if(result)
+      {
+         lastHedgeOpenPrice = ask;
+         hedgeTriggeredThisCycle = true;
+         lastHedgeType = ORDER_TYPE_BUY;
+         lastHedgeWasLoss = false;
+      }
+   }
+   else
+   {
+      result =
+      trade.Sell(
+         lot,
+         _Symbol,
+         bid,
+         0,
+         0,
+         "HEDGE"
+      );
+
+      if(result)
+      {
+         lastHedgeOpenPrice = bid;
+         hedgeTriggeredThisCycle = true;
+         lastHedgeType = ORDER_TYPE_SELL;
+         lastHedgeWasLoss = false;
+      }
+   }
+
+   trade.SetDeviationInPoints(20);
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE POSITION + REALIZED PL                                     |
+//+------------------------------------------------------------------+
+bool ClosePositionGetPL(
+   ulong ticket,
+   double &realizedPL
+)
+{
+   realizedPL = 0.0;
+
+   trade.SetDeviationInPoints(HedgeCloseDeviation);
+
+   bool result =
+   trade.PositionClose(ticket);
+
+   trade.SetDeviationInPoints(20);
+
+   if(!result)
+      return false;
+
+   ulong deal =
+   trade.ResultDeal();
+
+   if(deal > 0
+      && HistoryDealSelect(deal))
+   {
+      realizedPL =
+      HistoryDealGetDouble(
+         deal,
+         DEAL_PROFIT
+      );
+
+      realizedPL +=
+      HistoryDealGetDouble(
+         deal,
+         DEAL_SWAP
+      );
+
+      realizedPL +=
+      HistoryDealGetDouble(
+         deal,
+         DEAL_COMMISSION
+      );
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE SMART HEDGE (WITH DUAL TRAILING)                          |
+//+------------------------------------------------------------------+
+void ManageSmartHedge()
+{
+   if(!EnableHedge)
+      return;
+
+   double gridLoss =
+   MathMax(0,-GetGridProfit());
+
+   // CHECK IF NEW HEDGE SHOULD OPEN
+
+   if(!IsHedgeOpen()
+      && gridLoss >= HedgeTriggerUSD)
+   {
+      // CONDITIONAL HEDGE RE-OPENING
+      if(lastHedgeWasLoss && lastHedgeOpenPrice > 0)
+      {
+         double ask =
+         SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+         double bid =
+         SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+         bool priceReturned = false;
+
+         if(lastHedgeType == ORDER_TYPE_SELL)
+         {
+            if(ask >= lastHedgeOpenPrice)
+               priceReturned = true;
+         }
+         else if(lastHedgeType == ORDER_TYPE_BUY)
+         {
+            if(bid <= lastHedgeOpenPrice)
+               priceReturned = true;
+         }
+
+         if(!priceReturned)
+            return;
+      }
+
+      PrepareHedge();
+
+      OpenAutoHedge();
+
+      return;
+   }
+
+   // MANAGE EXISTING HEDGE WITH DUAL TRAILING
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsHedgePosition())
+         continue;
+
+      double profit =
+      PositionGetDouble(POSITION_PROFIT);
+
+      // NEW: TRACK WORST LOSS
+      if(profit < hedgeWorstLoss)
+         hedgeWorstLoss = profit;
+
+      // FIXED LOSS CLOSE (Hard Stop)
+
+      if(profit <= -HedgeFixedLossUSD)
+      {
+         double realized = 0.0;
+
+         if(ClosePositionGetPL(ticket,realized))
+         {
+            realizedHedgeLoss +=
+            MathAbs(realized);
+
+            hedgePeakProfit = 0.0;
+            hedgeWorstLoss = 0.0;
+
+            lastHedgeWasLoss = true;
+         }
+
+         return;
+      }
+
+      // NEW: LOSS RECOVERY TRAILING
+      // Close if loss improved significantly from worst point
+
+      if(hedgeWorstLoss <= -HedgeLossTrailStart)
+      {
+         double recoveryLevel = hedgeWorstLoss + HedgeLossTrailStep;
+
+         if(profit >= recoveryLevel)
+         {
+            double realized = 0.0;
+
+            if(ClosePositionGetPL(ticket,realized))
+            {
+               // Track as profit or loss
+               if(realized > 0)
+                  realizedHedgeProfit += realized;
+               else
+                  realizedHedgeLoss += MathAbs(realized);
+
+               hedgePeakProfit = 0.0;
+               hedgeWorstLoss = 0.0;
+
+               // If still in loss, mark for conditional re-open
+               lastHedgeWasLoss = (realized < 0);
+            }
+
+            return;
+         }
+      }
+
+      // TRACK PEAK PROFIT (for profit trailing)
+
+      if(profit > hedgePeakProfit)
+         hedgePeakProfit = profit;
+
+      // PROFIT TRAILING CLOSE
+
+      if(hedgePeakProfit >= HedgeTrailStart)
+      {
+         double trailLevel =
+         hedgePeakProfit
+         - HedgeTrailStep;
+
+         if(profit <= trailLevel)
+         {
+            double realized = 0.0;
+
+            if(ClosePositionGetPL(ticket,realized))
+            {
+               hedgePeakProfit = 0.0;
+               hedgeWorstLoss = 0.0;
+
+               // Track profit/loss
+               if(realized > 0)
+                  realizedHedgeProfit += realized;
+               else
+                  realizedHedgeLoss += MathAbs(realized);
+
+               lastHedgeWasLoss = false;
+            }
+
+            return;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE GRID                                                      |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   if(IsHedgeOpen())
+      return;
+
+   if(hedgeTriggeredThisCycle)
+      return;
+
+   if(!SpreadOK())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   if(!CooldownOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   // BUY GRID
+
+   if(currentDirection == 0)
+   {
+      int count =
+      CountGridPositions(
+         POSITION_TYPE_BUY
+      );
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer =
+      GetOuterGridPrice(
+         POSITION_TYPE_BUY
+      );
+
+      double distance =
+      (outer - bid) / _Point;
+
+      if(distance >= GridDistancePoints)
+      {
+         bool result =
+         trade.Buy(
+            NormalizeLot(LotSize),
+            _Symbol,
+            ask,
+            0,
+            0,
+            "GridBuy"
+         );
+
+         if(result)
+            lastTradeTime =
+            TimeCurrent();
+      }
+   }
+
+   // SELL GRID
+
+   else
+   {
+      int count =
+      CountGridPositions(
+         POSITION_TYPE_SELL
+      );
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer =
+      GetOuterGridPrice(
+         POSITION_TYPE_SELL
+      );
+
+      double distance =
+      (ask - outer) / _Point;
+
+      if(distance >= GridDistancePoints)
+      {
+         bool result =
+         trade.Sell(
+            NormalizeLot(LotSize),
+            _Symbol,
+            bid,
+            0,
+            0,
+            "GridSell"
+         );
+
+         if(result)
+            lastTradeTime =
+            TimeCurrent();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OPEN FIRST TRADE                                                 |
+//+------------------------------------------------------------------+
+void OpenFirstTrade()
+{
+   if(IsHedgeOpen())
+      return;
+
+   if(hedgeTriggeredThisCycle)
+      return;
+
+   if(!AllowTrading())
+      return;
+
+   if(!SpreadOK())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   if(currentDirection == -1)
+      currentDirection = 0;
+
+   bool result = false;
+
+   if(currentDirection == 0)
+   {
+      result =
+      trade.Buy(
+         NormalizeLot(LotSize),
+         _Symbol,
+         ask,
+         0,
+         0,
+         "GridBuy"
+      );
+   }
+   else
+   {
+      result =
+      trade.Sell(
+         NormalizeLot(LotSize),
+         _Symbol,
+         bid,
+         0,
+         0,
+         "GridSell"
+      );
+   }
+
+   if(result)
+      lastTradeTime = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| REQUEST CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void RequestCloseAll(bool lossMode)
+{
+   closeAllPending = true;
+
+   closeAfterLoss = lossMode;
+}
+
+//+------------------------------------------------------------------+
+//| PROCESS CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void ProcessCloseAll()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsOurPosition())
+         continue;
+
+      trade.PositionClose(ticket);
+   }
+
+   if(TotalOurPositions() == 0)
+   {
+      if(currentDirection == 0)
+         currentDirection = 1;
+      else
+         currentDirection = 0;
+
+      ResetEngine();
+
+      if(closeAfterLoss)
+      {
+         PauseTradingUntil =
+         TimeCurrent()
+         + (RestartAfterHours * 3600);
+      }
+
+      closeAllPending = false;
+
+      closeAfterLoss = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CHECK GRID TRAILING STOP                                         |
+//+------------------------------------------------------------------+
+bool CheckGridTrailingStop()
+{
+   if(hedgeTriggeredThisCycle)
+      return false;
+
+   double trueRecovery = GetTrueRecoveryValue();
+
+   if(trueRecovery > gridPeakProfit)
+      gridPeakProfit = trueRecovery;
+
+   if(gridPeakProfit >= GridTrailStart)
+   {
+      double trailLevel = gridPeakProfit - GridTrailStep;
+
+      if(trueRecovery <= trailLevel)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD                                                        |
+//+------------------------------------------------------------------+
+void Dashboard()
+{
+   double totalFloating =
+   GetTotalProfit();
+
+   double trueRecovery =
+   GetTrueRecoveryValue();
+
+   double netRealizedHedge =
+   realizedHedgeProfit - realizedHedgeLoss;
+
+   Comment(
+      "A7: FIXED GRID - DUAL TRAILING HEDGE\n",
+
+      "\n--- PROFIT/LOSS ---",
+
+      "\nFloating P/L: ",
+      DoubleToString(totalFloating,2),
+
+      "\nRealized Hedge Profit: +",
+      DoubleToString(realizedHedgeProfit,2),
+
+      "\nRealized Hedge Loss: -",
+      DoubleToString(realizedHedgeLoss,2),
+
+      "\nNet Realized Hedge: ",
+      DoubleToString(netRealizedHedge,2),
+
+      "\nTrue Recovery: ",
+      DoubleToString(trueRecovery,2),
+
+      "\n\n--- GRID TRAILING ---",
+
+      "\nGrid Peak Profit: ",
+      DoubleToString(gridPeakProfit,2),
+
+      "\nTrail Active: ",
+      hedgeTriggeredThisCycle ? "NO (Hedge)" : "YES",
+
+      "\nTrail Level: ",
+      (gridPeakProfit >= GridTrailStart && !hedgeTriggeredThisCycle)
+      ? DoubleToString(gridPeakProfit - GridTrailStep,2)
+      : "N/A",
+
+      "\n\n--- HEDGE DUAL TRAILING ---",
+
+      "\nHedge Peak Profit: ",
+      DoubleToString(hedgePeakProfit,2),
+
+      "\nHedge Worst Loss: ",
+      DoubleToString(hedgeWorstLoss,2),
+
+      "\nProfit Trail Active: ",
+      (hedgePeakProfit >= HedgeTrailStart) ? "YES" : "NO",
+
+      "\nLoss Trail Active: ",
+      (hedgeWorstLoss <= -HedgeLossTrailStart) ? "YES" : "NO",
+
+      "\nLoss Recovery Level: ",
+      (hedgeWorstLoss <= -HedgeLossTrailStart)
+      ? DoubleToString(hedgeWorstLoss + HedgeLossTrailStep,2)
+      : "N/A",
+
+      "\n\n--- STATUS ---",
+
+      "\nHedge Open: ",
+      IsHedgeOpen() ? "YES" : "NO",
+
+      "\nGrid Frozen: ",
+      hedgeTriggeredThisCycle ? "YES" : "NO",
+
+      "\nWait Price Return: ",
+      lastHedgeWasLoss ? "YES" : "NO",
+
+      "\n\n--- TARGETS ---",
+
+      "\nBasket Target: ",
+      DoubleToString(BasketProfit,2),
+
+      "\nDirection: ",
+      (currentDirection == 0) ? "BUY" : "SELL"
+   );
+}
+
+//+------------------------------------------------------------------+
+//| ON TICK                                                          |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(closeAllPending)
+   {
+      ProcessCloseAll();
+
+      Dashboard();
+
+      return;
+   }
+
+   if(PauseTradingUntil > 0
+      && TimeCurrent() < PauseTradingUntil)
+   {
+      Dashboard();
+
+      return;
+   }
+
+   if(lossLimitHitWaitingForHedge)
+   {
+      double trueRecovery = GetTrueRecoveryValue();
+
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+
+      if(IsHedgeOpen())
+      {
+         ManageSmartHedge();
+
+         Dashboard();
+
+         return;
+      }
+
+      if(currentDirection == 0)
+         currentDirection = 1;
+      else
+         currentDirection = 0;
+
+      PauseTradingUntil =
+      TimeCurrent()
+      + (RestartAfterHours * 3600);
+
+      ResetEngine();
+
+      Dashboard();
+
+      return;
+   }
+
+   if(!AllowTrading())
+   {
+      Dashboard();
+
+      return;
+   }
+
+   if(TotalOurPositions() == 1
+      && IsHedgeOpen())
+   {
+      double trueRecovery = GetTrueRecoveryValue();
+
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+
+      ManageSmartHedge();
+
+      Dashboard();
+
+      return;
+   }
+
+   if(TotalOurPositions() == 0)
+   {
+      if(hedgeTriggeredThisCycle)
+      {
+         if(currentDirection == 0)
+            currentDirection = 1;
+         else
+            currentDirection = 0;
+
+         ResetEngine();
+      }
+
+      OpenFirstTrade();
+
+      Dashboard();
+
+      return;
+   }
+
+   ManageSmartHedge();
+
+   double trueRecovery = GetTrueRecoveryValue();
+
+   if(hedgeTriggeredThisCycle)
+   {
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+   }
+   else
+   {
+      if(CheckGridTrailingStop())
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+   }
+
+   if(IsHedgeOpen())
+   {
+      Dashboard();
+
+      return;
+   }
+
+   ManageGrid();
+
+   double gridFloating =
+   GetGridProfit();
+
+   if(gridFloating <= BasketLossLimit)
+   {
+      CloseOnlyGridPositions();
+
+      if(IsHedgeOpen())
+      {
+         lossLimitHitWaitingForHedge = true;
+      }
+      else
+      {
+         PauseTradingUntil =
+         TimeCurrent()
+         + (RestartAfterHours * 3600);
+      }
+   }
+
+   Dashboard();
+}
+//+------------------------------------------------------------------+
