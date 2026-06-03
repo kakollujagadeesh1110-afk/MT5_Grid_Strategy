@@ -1,0 +1,1386 @@
+//+------------------------------------------------------------------+
+//|            XAUUSD GRID + SMART HEDGE ENGINE + TIME FILTER        |
+//|         VERSION 5: INCREMENTAL GRID + HEDGE + TIME FILTERED      |
+//|         - Incremental grid distance (200×N)                      |
+//|         - Hedge at trigger loss                                  |
+//|         - Grid trailing stop (disabled when hedge triggers)      |
+//|         - Profit pooling                                         |
+//|         - TIME FILTER: Trades only during optimal hours          |
+//|         - AUTO DST HANDLING: Works with MT5 broker time          |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//========================= INPUTS ==================================//
+
+input ulong  MagicNumber              = 26052509;
+
+//---------------- GRID ----------------//
+
+input double LotSize                  = 0.02;
+input int    GridIncrementStep        = 200;    // V4: Base increment (distance = Step × GridCount)
+input int    MaxTrades                = 50;
+
+//---------------- BASKET --------------//
+
+input double BasketProfit             = 10.0;
+input double BasketLossLimit          = -320.0;
+
+input int    RestartAfterHours        = 2;
+
+//---------------- GRID TRAILING STOP ----------------//
+
+input double GridTrailStart           = 20.0;   // Start trailing after this profit
+input double GridTrailStep            = 10.0;   // Close if profit drops this much from peak
+
+//---------------- HEDGE ---------------//
+
+input bool   EnableHedge              = true;
+
+input double HedgeTriggerUSD          = 150.0;  // Hedge triggers at this loss
+input double HedgeLot                 = 0.05;
+
+input double HedgeFixedLossUSD        = 75.0;
+
+input double HedgeTrailStart          = 20.0;
+input double HedgeTrailStep           = 10.0;
+
+input int    HedgeCloseDeviation      = 500;
+
+//---------------- TIME FILTER (V5) ----------------//
+// MT5 shows US time (EST/EDT) - DST handled automatically by broker
+// London-NY Overlap: 9:30 AM - 11:30 AM (US time) = BEST window
+// London Session: 3:00 AM - 9:30 AM (US time) = Good window
+
+input bool   EnableTimeFilter         = true;   // Enable trading time restrictions
+input int    TradingStartHour         = 9;      // Start hour (US time in MT5)
+input int    TradingStartMinute       = 30;     // Start minute
+input int    TradingEndHour           = 11;     // End hour (US time in MT5)
+input int    TradingEndMinute         = 30;     // End minute
+input bool   ClosePositionsOutsideHours = false; // Close all if outside trading hours
+
+// NOTE: MT5 broker time shows US Eastern (EST/EDT) automatically adjusted for DST
+// Recommended settings:
+// - PRIMARY (London-NY Overlap): Start 09:30, End 11:30
+// - SECONDARY (Full London): Start 03:00, End 11:30
+// - CONSERVATIVE (Peak hour only): Start 09:30, End 10:30
+
+//---------------- SAFETY --------------//
+
+input double StopTradingBalance       = 1100.0;
+
+input int    MaxSpreadPoints          = 80;
+
+input double MinMarginLevel           = 250.0;
+
+input int    TradeCooldownSeconds     = 3;
+
+//========================= GLOBALS =================================//
+
+int currentDirection = -1;
+
+double realizedHedgeLoss = 0.0;
+
+double realizedHedgeProfit = 0.0;
+
+double hedgePeakProfit = 0.0;
+
+double gridPeakProfit = 0.0;
+
+ENUM_ORDER_TYPE hedgeSignalType;
+
+datetime PauseTradingUntil = 0;
+
+double lastHedgeOpenPrice = 0.0;
+
+datetime lastTradeTime = 0;
+
+bool closeAllPending = false;
+bool closeAfterLoss  = false;
+
+//--- FLAGS FOR GRID/HEDGE CONTROL ---//
+
+bool hedgeTriggeredThisCycle = false;
+
+bool lastHedgeWasLoss = false;
+
+ENUM_ORDER_TYPE lastHedgeType;
+
+bool lossLimitHitWaitingForHedge = false;
+
+//+------------------------------------------------------------------+
+//| INIT                                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+
+   trade.SetDeviationInPoints(20);
+
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   // Display time filter status
+   if(EnableTimeFilter)
+   {
+      Print("=== TIME FILTER ENABLED ===");
+      Print("Trading Hours (MT5 Broker Time - US EST/EDT):");
+      Print("  Start: ", IntegerToString(TradingStartHour, 2, '0'), ":", IntegerToString(TradingStartMinute, 2, '0'));
+      Print("  End: ", IntegerToString(TradingEndHour, 2, '0'), ":", IntegerToString(TradingEndMinute, 2, '0'));
+      Print("  Close outside hours: ", ClosePositionsOutsideHours ? "YES" : "NO");
+      Print("NOTE: DST is automatically handled by MT5 broker time");
+      Print("============================");
+   }
+   else
+   {
+      Print("TIME FILTER DISABLED - Trading 24/7");
+   }
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| V5: CHECK IF WITHIN TRADING HOURS                                |
+//| MT5 broker time shows US time (EST/EDT) with auto DST handling  |
+//+------------------------------------------------------------------+
+bool IsWithinTradingHours()
+{
+   if(!EnableTimeFilter)
+      return true;  // No filter, always allow trading
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+
+   int currentMinutes = dt.hour * 60 + dt.min;
+   int startMinutes = TradingStartHour * 60 + TradingStartMinute;
+   int endMinutes = TradingEndHour * 60 + TradingEndMinute;
+
+   // Handle case where end time is past midnight (crosses day boundary)
+   if(endMinutes < startMinutes)
+   {
+      // e.g., 22:00 to 02:00 next day
+      return (currentMinutes >= startMinutes) || (currentMinutes <= endMinutes);
+   }
+   else
+   {
+      // Normal case: 9:30 to 11:30
+      return (currentMinutes >= startMinutes) && (currentMinutes <= endMinutes);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE LOT                                                    |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+
+   double maxLot =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+
+   double step =
+   SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+
+   if(lot < minLot)
+      lot = minLot;
+
+   if(lot > maxLot)
+      lot = maxLot;
+
+   lot =
+   MathFloor(lot / step) * step;
+
+   return NormalizeDouble(lot,2);
+}
+
+//+------------------------------------------------------------------+
+//| IS OUR POSITION                                                  |
+//+------------------------------------------------------------------+
+bool IsOurPosition()
+{
+   if(PositionGetString(POSITION_SYMBOL)
+      != _Symbol)
+      return false;
+
+   if((ulong)PositionGetInteger(POSITION_MAGIC)
+      != MagicNumber)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| IS GRID POSITION                                                 |
+//+------------------------------------------------------------------+
+bool IsGridPosition()
+{
+   if(!IsOurPosition())
+      return false;
+
+   string c =
+   PositionGetString(POSITION_COMMENT);
+
+   if(c == "GridBuy"
+      || c == "GridSell")
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| IS HEDGE POSITION                                                |
+//+------------------------------------------------------------------+
+bool IsHedgePosition()
+{
+   if(!IsOurPosition())
+      return false;
+
+   if(PositionGetString(POSITION_COMMENT)
+      == "HEDGE")
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| SPREAD CHECK                                                     |
+//+------------------------------------------------------------------+
+bool SpreadOK()
+{
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   double spread =
+   (ask - bid) / _Point;
+
+   if(spread > MaxSpreadPoints)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MARGIN CHECK                                                     |
+//+------------------------------------------------------------------+
+bool MarginOK()
+{
+   double ml =
+   AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+
+   if(ml <= 0)
+      return true;
+
+   if(ml < MinMarginLevel)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| ALLOW TRADING                                                    |
+//+------------------------------------------------------------------+
+bool AllowTrading()
+{
+   if(AccountInfoDouble(ACCOUNT_BALANCE)
+      >= StopTradingBalance)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| COOLDOWN CHECK                                                   |
+//+------------------------------------------------------------------+
+bool CooldownOK()
+{
+   if(TimeCurrent() - lastTradeTime
+      < TradeCooldownSeconds)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL OUR POSITIONS                                              |
+//+------------------------------------------------------------------+
+int TotalOurPositions()
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsOurPosition())
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| COUNT GRID POSITIONS                                             |
+//+------------------------------------------------------------------+
+int CountGridPositions(int type)
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      if(PositionGetInteger(POSITION_TYPE)
+         == type)
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL GRID POSITIONS (both types)                                |
+//+------------------------------------------------------------------+
+int TotalGridPositions()
+{
+   int count = 0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsGridPosition())
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL PROFIT (Floating P/L of all open positions)                |
+//+------------------------------------------------------------------+
+double GetTotalProfit()
+{
+   double profit = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsOurPosition())
+         continue;
+
+      profit +=
+      PositionGetDouble(POSITION_PROFIT);
+
+      profit +=
+      PositionGetDouble(POSITION_SWAP);
+   }
+
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| GRID PROFIT ONLY                                                 |
+//+------------------------------------------------------------------+
+double GetGridProfit()
+{
+   double profit = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      profit +=
+      PositionGetDouble(POSITION_PROFIT);
+
+      profit +=
+      PositionGetDouble(POSITION_SWAP);
+   }
+
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| TRUE RECOVERY VALUE                                              |
+//+------------------------------------------------------------------+
+double GetTrueRecoveryValue()
+{
+   double floatingPL = GetTotalProfit();
+
+   double netRealizedHedge = realizedHedgeProfit - realizedHedgeLoss;
+
+   return floatingPL + netRealizedHedge;
+}
+
+//+------------------------------------------------------------------+
+//| HEDGE OPEN CHECK                                                 |
+//+------------------------------------------------------------------+
+bool IsHedgeOpen()
+{
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsHedgePosition())
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE ONLY GRID POSITIONS                                        |
+//+------------------------------------------------------------------+
+void CloseOnlyGridPositions()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      trade.PositionClose(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OUTERMOST GRID PRICE                                             |
+//+------------------------------------------------------------------+
+double GetOuterGridPrice(int type)
+{
+   bool found = false;
+
+   double price = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      if(PositionGetInteger(POSITION_TYPE)
+         != type)
+         continue;
+
+      double p =
+      PositionGetDouble(POSITION_PRICE_OPEN);
+
+      if(!found)
+      {
+         found = true;
+         price = p;
+      }
+      else
+      {
+         if(type == POSITION_TYPE_BUY
+            && p < price)
+            price = p;
+
+         if(type == POSITION_TYPE_SELL
+            && p > price)
+            price = p;
+      }
+   }
+
+   return price;
+}
+
+//+------------------------------------------------------------------+
+//| V4: GET INCREMENTAL GRID DISTANCE                                |
+//| Distance = GridIncrementStep × CurrentGridCount                  |
+//+------------------------------------------------------------------+
+int GetIncrementalGridDistance()
+{
+   int gridCount = TotalGridPositions();
+
+   // If no grid yet, first distance is 1 × Step
+   if(gridCount == 0)
+      gridCount = 1;
+
+   return GridIncrementStep * gridCount;
+}
+
+//+------------------------------------------------------------------+
+//| RESET ENGINE                                                     |
+//+------------------------------------------------------------------+
+void ResetEngine()
+{
+   realizedHedgeLoss = 0.0;
+
+   realizedHedgeProfit = 0.0;
+
+   hedgePeakProfit = 0.0;
+
+   gridPeakProfit = 0.0;
+
+   lastHedgeOpenPrice = 0.0;
+
+   hedgeTriggeredThisCycle = false;
+   lastHedgeWasLoss = false;
+   lossLimitHitWaitingForHedge = false;
+}
+
+//+------------------------------------------------------------------+
+//| PREPARE HEDGE                                                    |
+//+------------------------------------------------------------------+
+void PrepareHedge()
+{
+   double buyLots = 0.0;
+   double sellLots = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      double lot =
+      PositionGetDouble(POSITION_VOLUME);
+
+      if(PositionGetInteger(POSITION_TYPE)
+         == POSITION_TYPE_BUY)
+      {
+         buyLots += lot;
+      }
+      else
+      {
+         sellLots += lot;
+      }
+   }
+
+   if(buyLots > sellLots)
+      hedgeSignalType = ORDER_TYPE_SELL;
+   else
+      hedgeSignalType = ORDER_TYPE_BUY;
+}
+
+//+------------------------------------------------------------------+
+//| OPEN AUTO HEDGE                                                  |
+//+------------------------------------------------------------------+
+void OpenAutoHedge()
+{
+   if(!EnableHedge)
+      return;
+
+   if(IsHedgeOpen())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   bool result = false;
+
+   hedgePeakProfit = 0.0;
+
+   double lot =
+   NormalizeLot(HedgeLot);
+
+   trade.SetDeviationInPoints(HedgeCloseDeviation);
+
+   if(hedgeSignalType == ORDER_TYPE_BUY)
+   {
+      result =
+      trade.Buy(
+         lot,
+         _Symbol,
+         ask,
+         0,
+         0,
+         "HEDGE"
+      );
+
+      if(result)
+      {
+         lastHedgeOpenPrice = ask;
+         hedgeTriggeredThisCycle = true;
+         lastHedgeType = ORDER_TYPE_BUY;
+         lastHedgeWasLoss = false;
+      }
+   }
+   else
+   {
+      result =
+      trade.Sell(
+         lot,
+         _Symbol,
+         bid,
+         0,
+         0,
+         "HEDGE"
+      );
+
+      if(result)
+      {
+         lastHedgeOpenPrice = bid;
+         hedgeTriggeredThisCycle = true;
+         lastHedgeType = ORDER_TYPE_SELL;
+         lastHedgeWasLoss = false;
+      }
+   }
+
+   trade.SetDeviationInPoints(20);
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE POSITION + REALIZED PL                                     |
+//+------------------------------------------------------------------+
+bool ClosePositionGetPL(
+   ulong ticket,
+   double &realizedPL
+)
+{
+   realizedPL = 0.0;
+
+   trade.SetDeviationInPoints(HedgeCloseDeviation);
+
+   bool result =
+   trade.PositionClose(ticket);
+
+   trade.SetDeviationInPoints(20);
+
+   if(!result)
+      return false;
+
+   ulong deal =
+   trade.ResultDeal();
+
+   if(deal > 0
+      && HistoryDealSelect(deal))
+   {
+      realizedPL =
+      HistoryDealGetDouble(
+         deal,
+         DEAL_PROFIT
+      );
+
+      realizedPL +=
+      HistoryDealGetDouble(
+         deal,
+         DEAL_SWAP
+      );
+
+      realizedPL +=
+      HistoryDealGetDouble(
+         deal,
+         DEAL_COMMISSION
+      );
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE SMART HEDGE                                               |
+//+------------------------------------------------------------------+
+void ManageSmartHedge()
+{
+   if(!EnableHedge)
+      return;
+
+   double gridLoss =
+   MathMax(0,-GetGridProfit());
+
+   if(!IsHedgeOpen()
+      && gridLoss >= HedgeTriggerUSD)
+   {
+      if(lastHedgeWasLoss && lastHedgeOpenPrice > 0)
+      {
+         double ask =
+         SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+         double bid =
+         SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+         bool priceReturned = false;
+
+         if(lastHedgeType == ORDER_TYPE_SELL)
+         {
+            if(ask >= lastHedgeOpenPrice)
+               priceReturned = true;
+         }
+         else if(lastHedgeType == ORDER_TYPE_BUY)
+         {
+            if(bid <= lastHedgeOpenPrice)
+               priceReturned = true;
+         }
+
+         if(!priceReturned)
+            return;
+      }
+
+      PrepareHedge();
+
+      OpenAutoHedge();
+
+      return;
+   }
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsHedgePosition())
+         continue;
+
+      double profit =
+      PositionGetDouble(POSITION_PROFIT);
+
+      if(profit <= -HedgeFixedLossUSD)
+      {
+         double realized = 0.0;
+
+         if(ClosePositionGetPL(ticket,realized))
+         {
+            realizedHedgeLoss +=
+            MathAbs(realized);
+
+            hedgePeakProfit = 0.0;
+
+            lastHedgeWasLoss = true;
+         }
+
+         return;
+      }
+
+      if(profit > hedgePeakProfit)
+         hedgePeakProfit = profit;
+
+      if(hedgePeakProfit >= HedgeTrailStart)
+      {
+         double trailLevel =
+         hedgePeakProfit
+         - HedgeTrailStep;
+
+         if(profit <= trailLevel)
+         {
+            double realized = 0.0;
+
+            if(ClosePositionGetPL(ticket,realized))
+            {
+               hedgePeakProfit = 0.0;
+
+               if(realized > 0)
+                  realizedHedgeProfit += realized;
+               else
+                  realizedHedgeLoss += MathAbs(realized);
+
+               lastHedgeWasLoss = false;
+            }
+
+            return;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| V4: MANAGE GRID WITH INCREMENTAL DISTANCE                        |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   if(IsHedgeOpen())
+      return;
+
+   if(hedgeTriggeredThisCycle)
+      return;
+
+   if(!SpreadOK())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   if(!CooldownOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   // V4: Get incremental distance based on current grid count
+   int requiredDistance = GetIncrementalGridDistance();
+
+   // BUY GRID
+
+   if(currentDirection == 0)
+   {
+      int count =
+      CountGridPositions(
+         POSITION_TYPE_BUY
+      );
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer =
+      GetOuterGridPrice(
+         POSITION_TYPE_BUY
+      );
+
+      double distance =
+      (outer - bid) / _Point;
+
+      // V4: Use incremental distance
+      if(distance >= requiredDistance)
+      {
+         bool result =
+         trade.Buy(
+            NormalizeLot(LotSize),
+            _Symbol,
+            ask,
+            0,
+            0,
+            "GridBuy"
+         );
+
+         if(result)
+            lastTradeTime =
+            TimeCurrent();
+      }
+   }
+
+   // SELL GRID
+
+   else
+   {
+      int count =
+      CountGridPositions(
+         POSITION_TYPE_SELL
+      );
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer =
+      GetOuterGridPrice(
+         POSITION_TYPE_SELL
+      );
+
+      double distance =
+      (ask - outer) / _Point;
+
+      // V4: Use incremental distance
+      if(distance >= requiredDistance)
+      {
+         bool result =
+         trade.Sell(
+            NormalizeLot(LotSize),
+            _Symbol,
+            bid,
+            0,
+            0,
+            "GridSell"
+         );
+
+         if(result)
+            lastTradeTime =
+            TimeCurrent();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OPEN FIRST TRADE                                                 |
+//+------------------------------------------------------------------+
+void OpenFirstTrade()
+{
+   if(IsHedgeOpen())
+      return;
+
+   if(hedgeTriggeredThisCycle)
+      return;
+
+   if(!AllowTrading())
+      return;
+
+   if(!SpreadOK())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   if(currentDirection == -1)
+      currentDirection = 0;
+
+   bool result = false;
+
+   if(currentDirection == 0)
+   {
+      result =
+      trade.Buy(
+         NormalizeLot(LotSize),
+         _Symbol,
+         ask,
+         0,
+         0,
+         "GridBuy"
+      );
+   }
+   else
+   {
+      result =
+      trade.Sell(
+         NormalizeLot(LotSize),
+         _Symbol,
+         bid,
+         0,
+         0,
+         "GridSell"
+      );
+   }
+
+   if(result)
+      lastTradeTime = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| REQUEST CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void RequestCloseAll(bool lossMode)
+{
+   closeAllPending = true;
+
+   closeAfterLoss = lossMode;
+}
+
+//+------------------------------------------------------------------+
+//| PROCESS CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void ProcessCloseAll()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsOurPosition())
+         continue;
+
+      trade.PositionClose(ticket);
+   }
+
+   if(TotalOurPositions() == 0)
+   {
+      if(currentDirection == 0)
+         currentDirection = 1;
+      else
+         currentDirection = 0;
+
+      ResetEngine();
+
+      if(closeAfterLoss)
+      {
+         PauseTradingUntil =
+         TimeCurrent()
+         + (RestartAfterHours * 3600);
+      }
+
+      closeAllPending = false;
+
+      closeAfterLoss = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CHECK GRID TRAILING STOP                                         |
+//+------------------------------------------------------------------+
+bool CheckGridTrailingStop()
+{
+   if(hedgeTriggeredThisCycle)
+      return false;
+
+   double trueRecovery = GetTrueRecoveryValue();
+
+   if(trueRecovery > gridPeakProfit)
+      gridPeakProfit = trueRecovery;
+
+   if(gridPeakProfit >= GridTrailStart)
+   {
+      double trailLevel = gridPeakProfit - GridTrailStep;
+
+      if(trueRecovery <= trailLevel)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD                                                        |
+//+------------------------------------------------------------------+
+void Dashboard()
+{
+   double totalFloating =
+   GetTotalProfit();
+
+   double trueRecovery =
+   GetTrueRecoveryValue();
+
+   double netRealizedHedge =
+   realizedHedgeProfit - realizedHedgeLoss;
+
+   int gridCount = TotalGridPositions();
+   int nextDistance = GetIncrementalGridDistance();
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string currentTime = StringFormat("%02d:%02d:%02d", dt.hour, dt.min, dt.sec);
+
+   bool withinHours = IsWithinTradingHours();
+
+   string closeMode;
+   if(hedgeTriggeredThisCycle)
+      closeMode = "FIXED TARGET";
+   else
+      closeMode = "TRAILING STOP";
+
+   Comment(
+      "GRID + HEDGE V5 (Incr + Hedge + Pool + Trail + TIME FILTER)\n",
+
+      "\n--- TIME FILTER ---",
+
+      "\nTime Filter: ",
+      EnableTimeFilter ? "ENABLED" : "DISABLED",
+
+      "\nCurrent Time (MT5): ",
+      currentTime,
+      " (US EST/EDT)",
+
+      "\nTrading Window: ",
+      StringFormat("%02d:%02d - %02d:%02d",
+         TradingStartHour, TradingStartMinute,
+         TradingEndHour, TradingEndMinute),
+
+      "\nStatus: ",
+      withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW",
+
+      "\nTrading Allowed: ",
+      (withinHours || !EnableTimeFilter) ? "YES" : "NO",
+
+      "\n--- V4: INCREMENTAL GRID ---",
+
+      "\nGrid Positions: ",
+      IntegerToString(gridCount),
+
+      "\nNext Grid Distance: ",
+      IntegerToString(nextDistance),
+      " pts",
+
+      "\nIncrement Step: ",
+      IntegerToString(GridIncrementStep),
+
+      "\n\n--- FLOATING P/L ---",
+
+      "\nFloating P/L: ",
+      DoubleToString(totalFloating,2),
+
+      "\n\n--- HEDGE P/L TRACKING ---",
+
+      "\nRealized Hedge Profit: +",
+      DoubleToString(realizedHedgeProfit,2),
+
+      "\nRealized Hedge Loss: -",
+      DoubleToString(realizedHedgeLoss,2),
+
+      "\nNet Realized Hedge: ",
+      DoubleToString(netRealizedHedge,2),
+
+      "\n\n--- CLOSE MODE ---",
+
+      "\nMode: ",
+      closeMode,
+
+      "\nGrid Peak Profit: ",
+      DoubleToString(gridPeakProfit,2),
+
+      "\nTrail Level: ",
+      (gridPeakProfit >= GridTrailStart)
+      ? DoubleToString(gridPeakProfit - GridTrailStep,2)
+      : "Not Active",
+
+      "\n\n--- TRUE RECOVERY ---",
+
+      "\nTrue Recovery Value: ",
+      DoubleToString(trueRecovery,2),
+
+      "\nFixed Target: ",
+      DoubleToString(BasketProfit,2),
+
+      "\n\n--- STATUS ---",
+
+      "\nHedge Open: ",
+      IsHedgeOpen()
+      ? "YES"
+      : "NO",
+
+      "\nHedge Triggered: ",
+      hedgeTriggeredThisCycle
+      ? "YES"
+      : "NO",
+
+      "\nLoss Limit Waiting: ",
+      lossLimitHitWaitingForHedge
+      ? "YES"
+      : "NO",
+
+      "\n\nNOTE: DST automatically handled by MT5 broker time"
+   );
+}
+
+//+------------------------------------------------------------------+
+//| ON TICK                                                          |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(closeAllPending)
+   {
+      ProcessCloseAll();
+
+      Dashboard();
+
+      return;
+   }
+
+   if(PauseTradingUntil > 0
+      && TimeCurrent() < PauseTradingUntil)
+   {
+      Dashboard();
+
+      return;
+   }
+
+   // V5: TIME FILTER CHECK
+   if(!IsWithinTradingHours())
+   {
+      // If outside trading hours and we have positions
+      if(ClosePositionsOutsideHours && TotalOurPositions() > 0)
+      {
+         RequestCloseAll(false);  // Close without pause
+
+         Dashboard();
+
+         return;
+      }
+
+      // Just show dashboard and wait
+      Dashboard();
+
+      return;
+   }
+
+   if(lossLimitHitWaitingForHedge)
+   {
+      double trueRecovery = GetTrueRecoveryValue();
+
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+
+      if(IsHedgeOpen())
+      {
+         ManageSmartHedge();
+
+         Dashboard();
+
+         return;
+      }
+
+      if(currentDirection == 0)
+         currentDirection = 1;
+      else
+         currentDirection = 0;
+
+      PauseTradingUntil =
+      TimeCurrent()
+      + (RestartAfterHours * 3600);
+
+      ResetEngine();
+
+      Dashboard();
+
+      return;
+   }
+
+   if(!AllowTrading())
+   {
+      Dashboard();
+
+      return;
+   }
+
+   if(TotalOurPositions() == 1
+      && IsHedgeOpen())
+   {
+      double trueRecovery = GetTrueRecoveryValue();
+
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+
+      ManageSmartHedge();
+
+      Dashboard();
+
+      return;
+   }
+
+   if(TotalOurPositions() == 0)
+   {
+      if(hedgeTriggeredThisCycle)
+      {
+         if(currentDirection == 0)
+            currentDirection = 1;
+         else
+            currentDirection = 0;
+
+         ResetEngine();
+      }
+
+      OpenFirstTrade();
+
+      Dashboard();
+
+      return;
+   }
+
+   ManageSmartHedge();
+
+   double trueRecovery = GetTrueRecoveryValue();
+
+   if(hedgeTriggeredThisCycle)
+   {
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+   }
+   else
+   {
+      // NO HEDGE: Use ONLY grid trailing stop (not profit target)
+      // Profit target only applies when hedge is triggered
+      if(CheckGridTrailingStop())
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+   }
+
+   if(IsHedgeOpen())
+   {
+      Dashboard();
+
+      return;
+   }
+
+   ManageGrid();
+
+   double gridFloating =
+   GetGridProfit();
+
+   if(gridFloating <= BasketLossLimit)
+   {
+      CloseOnlyGridPositions();
+
+      if(IsHedgeOpen())
+      {
+         lossLimitHitWaitingForHedge = true;
+      }
+      else
+      {
+         PauseTradingUntil =
+         TimeCurrent()
+         + (RestartAfterHours * 3600);
+      }
+   }
+
+   Dashboard();
+}
+//+------------------------------------------------------------------+
