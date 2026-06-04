@@ -1408,100 +1408,63 @@ void Dashboard()
    if(!dayAllowed) blockReasons += "\n  >> DAY RESTRICTED";
    if(manualPause) blockReasons += "\n  >> MANUALLY PAUSED";
 
-   Comment(
-      "GRID + HEDGE V6 (Incr + Hedge + Pool + Trail + DUAL WINDOW + DAY FILTER)\n",
-      "\n--- TIME FILTER ---",
-      "\nTime Filter: ", EnableTimeFilter ? "ENABLED" : "DISABLED",
-      "\nTrading Mode: ", modeName,
-      windowInfo,
-      "\nCurrent Time (MT5): ", currentTime, " (US EST/EDT)",
-      currentWindowInfo,
-      "\nTime Status: ", withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW",
+   // Build complete dashboard as single string
+   string dashboard =
+      "GRID + HEDGE V6 (Incr + Hedge + Pool + Trail + DUAL WINDOW + DAY FILTER)\n" +
+      "\n--- TIME FILTER ---" +
+      "\nTime Filter: " + (EnableTimeFilter ? "ENABLED" : "DISABLED") +
+      "\nTrading Mode: " + modeName +
+      windowInfo +
+      "\nCurrent Time (MT5): " + currentTime + " (US EST/EDT)" +
+      currentWindowInfo +
+      "\nTime Status: " + (withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW") +
 
-      "\n--- DAY FILTER ---",
-      "\nDay Filter: ", EnableDayFilter ? "ENABLED" : "DISABLED",
-      "\nToday: ", dayName, dayBestTag,
-      dayStatusInfo,
-      mondayInfo,
-      fridayInfo,
+      "\n--- DAY FILTER ---" +
+      "\nDay Filter: " + (EnableDayFilter ? "ENABLED" : "DISABLED") +
+      "\nToday: " + dayName + dayBestTag +
+      dayStatusInfo +
+      mondayInfo +
+      fridayInfo +
 
-      "\n--- MANUAL CONTROL ---",
-      "\nManual Pause: ", manualPause ? "ON (PAUSED)" : "OFF",
-      "\nControl: Press F3 > ", ManualPauseVarName,
-      pauseAction,
+      "\n--- MANUAL CONTROL ---" +
+      "\nManual Pause: " + (manualPause ? "ON (PAUSED)" : "OFF") +
+      "\nControl: Press F3 > " + ManualPauseVarName +
+      pauseAction +
 
-      "\n--- TRADING STATUS ---",
-      "\nOverall Status: ", (withinHours && dayAllowed && !manualPause) ? "TRADING ALLOWED" : "TRADING BLOCKED",
-      blockReasons,
+      "\n--- TRADING STATUS ---" +
+      "\nOverall Status: " + ((withinHours && dayAllowed && !manualPause) ? "TRADING ALLOWED" : "TRADING BLOCKED") +
+      blockReasons +
 
-      "\n\n--- INCREMENTAL GRID ---",
+      "\n\n--- INCREMENTAL GRID ---" +
+      "\nGrid Positions: " + IntegerToString(gridCount) +
+      "\nNext Grid Distance: " + IntegerToString(nextDistance) + " pts" +
+      "\nIncrement Step: " + IntegerToString(GridIncrementStep) +
 
-      "\nGrid Positions: ",
-      IntegerToString(gridCount),
+      "\n\n--- FLOATING P/L ---" +
+      "\nFloating P/L: " + DoubleToString(totalFloating,2) +
 
-      "\nNext Grid Distance: ",
-      IntegerToString(nextDistance),
-      " pts",
+      "\n\n--- HEDGE P/L TRACKING ---" +
+      "\nRealized Hedge Profit: +" + DoubleToString(realizedHedgeProfit,2) +
+      "\nRealized Hedge Loss: -" + DoubleToString(realizedHedgeLoss,2) +
+      "\nNet Realized Hedge: " + DoubleToString(netRealizedHedge,2) +
 
-      "\nIncrement Step: ",
-      IntegerToString(GridIncrementStep),
+      "\n\n--- CLOSE MODE ---" +
+      "\nMode: " + closeMode +
+      "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2) +
+      "\nTrail Level: " + ((gridPeakProfit >= GridTrailStart) ? DoubleToString(gridPeakProfit - GridTrailStep,2) : "Not Active") +
 
-      "\n\n--- FLOATING P/L ---",
+      "\n\n--- TRUE RECOVERY ---" +
+      "\nTrue Recovery Value: " + DoubleToString(trueRecovery,2) +
+      "\nFixed Target: " + DoubleToString(BasketProfit,2) +
 
-      "\nFloating P/L: ",
-      DoubleToString(totalFloating,2),
+      "\n\n--- STATUS ---" +
+      "\nHedge Open: " + (IsHedgeOpen() ? "YES" : "NO") +
+      "\nHedge Triggered: " + (hedgeTriggeredThisCycle ? "YES" : "NO") +
+      "\nLoss Limit Waiting: " + (lossLimitHitWaitingForHedge ? "YES" : "NO") +
 
-      "\n\n--- HEDGE P/L TRACKING ---",
+      "\n\nNOTE: DST automatically handled by MT5 broker time";
 
-      "\nRealized Hedge Profit: +",
-      DoubleToString(realizedHedgeProfit,2),
-
-      "\nRealized Hedge Loss: -",
-      DoubleToString(realizedHedgeLoss,2),
-
-      "\nNet Realized Hedge: ",
-      DoubleToString(netRealizedHedge,2),
-
-      "\n\n--- CLOSE MODE ---",
-
-      "\nMode: ",
-      closeMode,
-
-      "\nGrid Peak Profit: ",
-      DoubleToString(gridPeakProfit,2),
-
-      "\nTrail Level: ",
-      (gridPeakProfit >= GridTrailStart)
-      ? DoubleToString(gridPeakProfit - GridTrailStep,2)
-      : "Not Active",
-
-      "\n\n--- TRUE RECOVERY ---",
-
-      "\nTrue Recovery Value: ",
-      DoubleToString(trueRecovery,2),
-
-      "\nFixed Target: ",
-      DoubleToString(BasketProfit,2),
-
-      "\n\n--- STATUS ---",
-
-      "\nHedge Open: ",
-      IsHedgeOpen()
-      ? "YES"
-      : "NO",
-
-      "\nHedge Triggered: ",
-      hedgeTriggeredThisCycle
-      ? "YES"
-      : "NO",
-
-      "\nLoss Limit Waiting: ",
-      lossLimitHitWaitingForHedge
-      ? "YES"
-      : "NO",
-
-      "\n\nNOTE: DST automatically handled by MT5 broker time"
-   );
+   Comment(dashboard);
 }
 
 //+------------------------------------------------------------------+
