@@ -7,7 +7,6 @@
 //|         - Profit pooling                                         |
 //|         - DUAL WINDOW: Early London + Overlap (skips gap)        |
 //|         - DAY FILTER: Monday/Friday restrictions                 |
-//|         - MANUAL PAUSE: Via global variables (F3 in MT5)         |
 //|         - AUTO DST HANDLING: Works with MT5 broker time          |
 //+------------------------------------------------------------------+
 #property strict
@@ -52,15 +51,15 @@ input double HedgeTrailStep           = 10.0;
 input int    HedgeCloseDeviation      = 500;
 
 //---------------- TIME FILTER (V6) ----------------//
-// MT5 shows US time (EST/EDT) - DST handled automatically by broker
-// All times remain same year-round - no manual DST adjustment needed!
+// MT5 shows UTC+3 time - DST handled automatically by broker
+// All times are in UTC+3 timezone
 
 enum ENUM_TRADING_MODE
 {
-   MODE_DUAL_WINDOW,      // Early London (3:00-7:30) + Overlap (9:30-11:30) - SKIPS GAP (DEFAULT)
-   MODE_OVERLAP_ONLY,     // London-NY Overlap: 9:30-11:30 AM (BEST for no-hedge, conservative)
-   MODE_FULL_LONDON,      // Full London: 3:00 AM-11:30 AM (Continuous, includes gap)
-   MODE_PEAK_HOUR,        // Peak Hour: 9:30-10:30 AM (Ultra-conservative)
+   MODE_DUAL_WINDOW,      // Early London (11:00-15:30) + Overlap (17:30-19:30) - SKIPS GAP (DEFAULT)
+   MODE_OVERLAP_ONLY,     // London-NY Overlap: 17:30-19:30 (BEST for no-hedge, conservative)
+   MODE_FULL_LONDON,      // Full London: 11:00-19:30 (Continuous, includes gap)
+   MODE_PEAK_HOUR,        // Peak Hour: 17:30-18:30 (Ultra-conservative)
    MODE_CUSTOM            // Custom: Set your own hours below
 };
 
@@ -68,18 +67,19 @@ input bool   EnableTimeFilter         = true;   // Enable trading time restricti
 input ENUM_TRADING_MODE TradingMode   = MODE_DUAL_WINDOW; // Trading window preset (V6: DEFAULT = Dual Window)
 
 // Custom time settings (only used if TradingMode = MODE_CUSTOM)
-input int    CustomStartHour          = 9;      // Custom start hour (US time in MT5)
+input int    CustomStartHour          = 17;     // Custom start hour (UTC+3 time in MT5)
 input int    CustomStartMinute        = 30;     // Custom start minute
-input int    CustomEndHour            = 11;     // Custom end hour (US time in MT5)
+input int    CustomEndHour            = 19;     // Custom end hour (UTC+3 time in MT5)
 input int    CustomEndMinute          = 30;     // Custom end minute
 
 input bool   ClosePositionsOutsideHours = false; // Close all if outside trading hours
 
-// NOTE: MT5 broker time shows US Eastern (EST/EDT) automatically adjusted for DST
-// Because MT5 shows US time, settings work year-round:
-//   Summer (EDT): London 8am = 3:00 AM EDT, London close = 11:30 AM EDT
-//   Winter (EST): London 8am = 3:00 AM EST, London close = 11:30 AM EST
-// Result: Same MT5 time settings work for both summer and winter!
+// NOTE: MT5 broker time shows UTC+3 automatically adjusted for DST
+// All trading times are in UTC+3 timezone
+// Market sessions in UTC+3:
+//   Early London: 11:00-15:30 UTC+3
+//   Gap period: 15:30-17:30 UTC+3 (lower quality, skipped in DUAL_WINDOW mode)
+//   London-NY Overlap: 17:30-19:30 UTC+3 (highest volatility)
 
 //---------------- DAY FILTER (V6) ----------------//
 
@@ -87,20 +87,11 @@ input bool   EnableDayFilter          = true;   // Enable day-of-week restrictio
 
 // Monday Settings (avoid early trading after weekend gap)
 input bool   SkipMondayEarly          = true;   // Skip Monday before this hour
-input int    MondayStartHour          = 15;     // Monday start at 3:00 PM US time (after gap settlement)
+input int    MondayStartHour          = 23;     // Monday start at 11:00 PM UTC+3 (after gap settlement)
 
-// Friday Settings (avoid late trading before weekend)
-input bool   StopFridayLate           = true;   // Stop Friday after this hour
-input int    FridayEndHour            = 21;     // Friday stop at 9:00 PM US time (before weekend risk)
-
-//---------------- MANUAL PAUSE (V6) ----------------//
-// Control trading manually via Global Variables (F3 in MT5)
-// Global Variable Name: "B9_ManualPause"
-//   Set to 0 = Resume Trading
-//   Set to 1 = Pause Trading
-// No need to restart EA - changes take effect immediately
-
-string ManualPauseVarName = "B9_ManualPause";
+// Friday/Saturday Settings (avoid late trading before weekend)
+input bool   StopFridayLate           = true;   // Stop Saturday morning after this hour
+input int    FridayEndHour            = 5;      // Saturday stop at 05:00 AM UTC+3 (Friday 9 PM US = Sat 5 AM UTC+3)
 
 //---------------- SAFETY --------------//
 
@@ -156,13 +147,6 @@ int OnInit()
 
    trade.SetTypeFillingBySymbol(_Symbol);
 
-   // V6: Initialize manual pause global variable if it doesn't exist
-   if(!GlobalVariableCheck(ManualPauseVarName))
-   {
-      GlobalVariableSet(ManualPauseVarName, 0);  // 0 = Not paused (trading allowed)
-      Print("Created global variable: ", ManualPauseVarName, " = 0 (Trading)");
-   }
-
    Print("========================================");
    Print("     GRID V6 INITIALIZATION");
    Print("========================================");
@@ -173,10 +157,10 @@ int OnInit()
       string modeName;
       switch(TradingMode)
       {
-         case MODE_DUAL_WINDOW: modeName = "Dual Window (3:00-7:30 + 9:30-11:30)"; break;
-         case MODE_OVERLAP_ONLY: modeName = "London-NY Overlap (9:30-11:30)"; break;
-         case MODE_FULL_LONDON: modeName = "Full London Session (3:00-11:30)"; break;
-         case MODE_PEAK_HOUR: modeName = "Peak Hour Only (9:30-10:30)"; break;
+         case MODE_DUAL_WINDOW: modeName = "Dual Window (11:00-15:30 + 17:30-19:30)"; break;
+         case MODE_OVERLAP_ONLY: modeName = "London-NY Overlap (17:30-19:30)"; break;
+         case MODE_FULL_LONDON: modeName = "Full London Session (11:00-19:30)"; break;
+         case MODE_PEAK_HOUR: modeName = "Peak Hour Only (17:30-18:30)"; break;
          case MODE_CUSTOM: modeName = "Custom Hours"; break;
          default: modeName = "Unknown"; break;
       }
@@ -186,9 +170,9 @@ int OnInit()
 
       if(TradingMode == MODE_DUAL_WINDOW)
       {
-         Print("  Window 1: 03:00 - 07:30 (Early London)");
-         Print("  Window 2: 09:30 - 11:30 (London-NY Overlap)");
-         Print("  GAP SKIPPED: 07:30 - 09:30 (No trading)");
+         Print("  Window 1: 11:00 - 15:30 (Early London)");
+         Print("  Window 2: 17:30 - 19:30 (London-NY Overlap)");
+         Print("  GAP SKIPPED: 15:30 - 17:30 (No trading)");
       }
       else
       {
@@ -211,9 +195,9 @@ int OnInit()
    {
       Print("=== DAY FILTER: ENABLED ===");
       if(SkipMondayEarly)
-         Print("  Monday: Skip until ", IntegerToString(MondayStartHour, 2, '0'), ":00");
+         Print("  Monday: Skip until ", IntegerToString(MondayStartHour, 2, '0'), ":00 UTC+3");
       if(StopFridayLate)
-         Print("  Friday: Stop after ", IntegerToString(FridayEndHour, 2, '0'), ":00");
+         Print("  Saturday: Stop after ", IntegerToString(FridayEndHour, 2, '0'), ":00 UTC+3");
       Print("  Best Days: Tuesday-Thursday");
    }
    else
@@ -221,16 +205,9 @@ int OnInit()
       Print("=== DAY FILTER: DISABLED ===");
    }
 
-   // Display manual pause control
-   Print("=== MANUAL CONTROL ===");
-   Print("Global Variable: ", ManualPauseVarName);
-   Print("  Press F3 in MT5 to open Global Variables");
-   Print("  Set ", ManualPauseVarName, " = 1 to PAUSE");
-   Print("  Set ", ManualPauseVarName, " = 0 to RESUME");
-
    Print("========================================");
-   Print("NOTE: DST automatically handled by MT5");
-   Print("      Same settings work year-round!");
+   Print("NOTE: All times in UTC+3 timezone");
+   Print("      DST automatically handled by MT5");
    Print("========================================");
 
    return(INIT_SUCCEEDED);
@@ -246,30 +223,30 @@ void GetTradingHours(int &startHour, int &startMin, int &endHour, int &endMin)
       case MODE_DUAL_WINDOW:
          // For dual window, return Window 1 times
          // (Window 2 is checked separately in IsWithinTradingHours)
-         startHour = 3;
+         startHour = 11;
          startMin = 0;
-         endHour = 7;
+         endHour = 15;
          endMin = 30;
          break;
 
       case MODE_OVERLAP_ONLY:
-         startHour = 9;
+         startHour = 17;
          startMin = 30;
-         endHour = 11;
+         endHour = 19;
          endMin = 30;
          break;
 
       case MODE_FULL_LONDON:
-         startHour = 3;
+         startHour = 11;
          startMin = 0;
-         endHour = 11;
+         endHour = 19;
          endMin = 30;
          break;
 
       case MODE_PEAK_HOUR:
-         startHour = 9;
+         startHour = 17;
          startMin = 30;
-         endHour = 10;
+         endHour = 18;
          endMin = 30;
          break;
 
@@ -282,9 +259,9 @@ void GetTradingHours(int &startHour, int &startMin, int &endHour, int &endMin)
 
       default:
          // Default to dual window
-         startHour = 3;
+         startHour = 11;
          startMin = 0;
-         endHour = 7;
+         endHour = 15;
          endMin = 30;
          break;
    }
@@ -292,8 +269,7 @@ void GetTradingHours(int &startHour, int &startMin, int &endHour, int &endMin)
 
 //+------------------------------------------------------------------+
 //| V6: CHECK IF WITHIN TRADING HOURS                                |
-//| MT5 broker time shows US time (EST/EDT) with auto DST handling  |
-//| Works for both summer (EDT) and winter (EST) automatically!     |
+//| MT5 broker time shows UTC+3 with auto DST handling               |
 //| V6: Handles dual window mode (2 separate windows with gap)      |
 //+------------------------------------------------------------------+
 bool IsWithinTradingHours()
@@ -309,13 +285,13 @@ bool IsWithinTradingHours()
    // V6: Special handling for MODE_DUAL_WINDOW
    if(TradingMode == MODE_DUAL_WINDOW)
    {
-      // Window 1: 3:00 AM - 7:30 AM (Early London)
-      int window1Start = 3 * 60 + 0;    // 180 minutes
-      int window1End = 7 * 60 + 30;      // 450 minutes
+      // Window 1: 11:00 - 15:30 (Early London)
+      int window1Start = 11 * 60 + 0;    // 660 minutes
+      int window1End = 15 * 60 + 30;      // 930 minutes
 
-      // Window 2: 9:30 AM - 11:30 AM (London-NY Overlap)
-      int window2Start = 9 * 60 + 30;    // 570 minutes
-      int window2End = 11 * 60 + 30;     // 690 minutes
+      // Window 2: 17:30 - 19:30 (London-NY Overlap)
+      int window2Start = 17 * 60 + 30;    // 1050 minutes
+      int window2End = 19 * 60 + 30;     // 1170 minutes
 
       // Check if in either window
       bool inWindow1 = (currentMinutes >= window1Start) && (currentMinutes <= window1End);
@@ -347,6 +323,7 @@ bool IsWithinTradingHours()
 //+------------------------------------------------------------------+
 //| V6: CHECK DAY-OF-WEEK FILTER                                     |
 //| Returns true if trading allowed based on day/time restrictions  |
+//| NOTE: UTC+3 timezone - Friday 21:00 US = Saturday 05:00 UTC+3   |
 //+------------------------------------------------------------------+
 bool IsTradingDayAllowed()
 {
@@ -358,7 +335,7 @@ bool IsTradingDayAllowed()
 
    // dt.day_of_week: 0=Sunday, 1=Monday, 2=Tuesday, ..., 6=Saturday
 
-   // Monday restrictions
+   // Monday restrictions (skip before 23:00 UTC+3 = before 15:00 US Monday)
    if(dt.day_of_week == 1 && SkipMondayEarly)
    {
       // It's Monday, check if before allowed start hour
@@ -366,36 +343,20 @@ bool IsTradingDayAllowed()
          return false;  // Too early on Monday
    }
 
-   // Friday restrictions
-   if(dt.day_of_week == 5 && StopFridayLate)
+   // Saturday restrictions (stop after 05:00 UTC+3 = after 21:00 US Friday)
+   // Allow Saturday early morning (00:00-04:59 UTC+3 = Friday evening US)
+   if(dt.day_of_week == 6 && StopFridayLate)
    {
-      // It's Friday, check if after stop hour
+      // It's Saturday, check if after stop hour
       if(dt.hour >= FridayEndHour)
-         return false;  // Too late on Friday
+         return false;  // Too late - Friday evening ended in US
    }
 
-   // Weekend (should not happen with XAUUSD, but check anyway)
-   if(dt.day_of_week == 0 || dt.day_of_week == 6)
-      return false;  // No trading on weekends
+   // Sunday - no trading
+   if(dt.day_of_week == 0)
+      return false;  // No trading on Sunday
 
    return true;  // All checks passed
-}
-
-//+------------------------------------------------------------------+
-//| V6: CHECK MANUAL PAUSE STATUS                                    |
-//| Returns true if manually paused via global variable             |
-//+------------------------------------------------------------------+
-bool IsManuallyPaused()
-{
-   if(!GlobalVariableCheck(ManualPauseVarName))
-   {
-      // Variable doesn't exist, create it (not paused)
-      GlobalVariableSet(ManualPauseVarName, 0);
-      return false;
-   }
-
-   double value = GlobalVariableGet(ManualPauseVarName);
-   return (value == 1.0);  // 1 = Paused, 0 = Not paused
 }
 
 //+------------------------------------------------------------------+
@@ -1332,7 +1293,6 @@ void Dashboard()
    GetTradingHours(startHour, startMin, endHour, endMin);
 
    bool dayAllowed = IsTradingDayAllowed();
-   bool manualPause = IsManuallyPaused();
 
    string modeName;
    switch(TradingMode)
@@ -1350,9 +1310,9 @@ void Dashboard()
    if(TradingMode == MODE_DUAL_WINDOW && withinHours)
    {
       int currentMinutes = dt.hour * 60 + dt.min;
-      if(currentMinutes >= 180 && currentMinutes <= 450)
+      if(currentMinutes >= 660 && currentMinutes <= 930)
          currentWindow = "Window 1 (Early London)";
-      else if(currentMinutes >= 570 && currentMinutes <= 690)
+      else if(currentMinutes >= 1050 && currentMinutes <= 1170)
          currentWindow = "Window 2 (Overlap)";
    }
 
@@ -1395,74 +1355,66 @@ void Dashboard()
 
    string mondayInfo = "";
    if(dt.day_of_week == 1 && SkipMondayEarly)
-      mondayInfo = StringFormat("\nMonday Skip: Before %02d:00", MondayStartHour);
+      mondayInfo = StringFormat("\nMonday Skip: Before %02d:00 UTC+3", MondayStartHour);
 
-   string fridayInfo = "";
-   if(dt.day_of_week == 5 && StopFridayLate)
-      fridayInfo = StringFormat("\nFriday Stop: After %02d:00", FridayEndHour);
-
-   string pauseAction = manualPause ? "\nSet to 0 to RESUME" : "\nSet to 1 to PAUSE";
+   string saturdayInfo = "";
+   if(dt.day_of_week == 6 && StopFridayLate)
+      saturdayInfo = StringFormat("\nSaturday Stop: After %02d:00 UTC+3", FridayEndHour);
 
    string blockReasons = "";
    if(!withinHours) blockReasons += "\n  >> OUTSIDE TIME WINDOW";
    if(!dayAllowed) blockReasons += "\n  >> DAY RESTRICTED";
-   if(manualPause) blockReasons += "\n  >> MANUALLY PAUSED";
 
-   // Build complete dashboard as single string
-   string dashboard =
-      "GRID + HEDGE V6 (Incr + Hedge + Pool + Trail + DUAL WINDOW + DAY FILTER)\n" +
-      "\n--- TIME FILTER ---" +
-      "\nTime Filter: " + (EnableTimeFilter ? "ENABLED" : "DISABLED") +
-      "\nTrading Mode: " + modeName +
-      windowInfo +
-      "\nCurrent Time (MT5): " + currentTime + " (US EST/EDT)" +
-      currentWindowInfo +
-      "\nTime Status: " + (withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW") +
+   // Build complete dashboard incrementally to avoid expression limits
+   string dashboard = "GRID + HEDGE V6 (Incr + Hedge + Pool + Trail + DUAL WINDOW + DAY FILTER)\n";
 
-      "\n--- DAY FILTER ---" +
-      "\nDay Filter: " + (EnableDayFilter ? "ENABLED" : "DISABLED") +
-      "\nToday: " + dayName + dayBestTag +
-      dayStatusInfo +
-      mondayInfo +
-      fridayInfo +
+   dashboard += "\n--- TIME FILTER ---";
+   dashboard += "\nTime Filter: " + (EnableTimeFilter ? "ENABLED" : "DISABLED");
+   dashboard += "\nTrading Mode: " + modeName;
+   dashboard += windowInfo;
+   dashboard += "\nCurrent Time (MT5): " + currentTime + " (UTC+3)";
+   dashboard += currentWindowInfo;
+   dashboard += "\nTime Status: " + (withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW");
 
-      "\n--- MANUAL CONTROL ---" +
-      "\nManual Pause: " + (manualPause ? "ON (PAUSED)" : "OFF") +
-      "\nControl: Press F3 > " + ManualPauseVarName +
-      pauseAction +
+   dashboard += "\n--- DAY FILTER ---";
+   dashboard += "\nDay Filter: " + (EnableDayFilter ? "ENABLED" : "DISABLED");
+   dashboard += "\nToday: " + dayName + dayBestTag;
+   dashboard += dayStatusInfo;
+   dashboard += mondayInfo;
+   dashboard += saturdayInfo;
 
-      "\n--- TRADING STATUS ---" +
-      "\nOverall Status: " + ((withinHours && dayAllowed && !manualPause) ? "TRADING ALLOWED" : "TRADING BLOCKED") +
-      blockReasons +
+   dashboard += "\n--- TRADING STATUS ---";
+   dashboard += "\nOverall Status: " + ((withinHours && dayAllowed) ? "TRADING ALLOWED" : "TRADING BLOCKED");
+   dashboard += blockReasons;
 
-      "\n\n--- INCREMENTAL GRID ---" +
-      "\nGrid Positions: " + IntegerToString(gridCount) +
-      "\nNext Grid Distance: " + IntegerToString(nextDistance) + " pts" +
-      "\nIncrement Step: " + IntegerToString(GridIncrementStep) +
+   dashboard += "\n\n--- INCREMENTAL GRID ---";
+   dashboard += "\nGrid Positions: " + IntegerToString(gridCount);
+   dashboard += "\nNext Grid Distance: " + IntegerToString(nextDistance) + " pts";
+   dashboard += "\nIncrement Step: " + IntegerToString(GridIncrementStep);
 
-      "\n\n--- FLOATING P/L ---" +
-      "\nFloating P/L: " + DoubleToString(totalFloating,2) +
+   dashboard += "\n\n--- FLOATING P/L ---";
+   dashboard += "\nFloating P/L: " + DoubleToString(totalFloating,2);
 
-      "\n\n--- HEDGE P/L TRACKING ---" +
-      "\nRealized Hedge Profit: +" + DoubleToString(realizedHedgeProfit,2) +
-      "\nRealized Hedge Loss: -" + DoubleToString(realizedHedgeLoss,2) +
-      "\nNet Realized Hedge: " + DoubleToString(netRealizedHedge,2) +
+   dashboard += "\n\n--- HEDGE P/L TRACKING ---";
+   dashboard += "\nRealized Hedge Profit: +" + DoubleToString(realizedHedgeProfit,2);
+   dashboard += "\nRealized Hedge Loss: -" + DoubleToString(realizedHedgeLoss,2);
+   dashboard += "\nNet Realized Hedge: " + DoubleToString(netRealizedHedge,2);
 
-      "\n\n--- CLOSE MODE ---" +
-      "\nMode: " + closeMode +
-      "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2) +
-      "\nTrail Level: " + ((gridPeakProfit >= GridTrailStart) ? DoubleToString(gridPeakProfit - GridTrailStep,2) : "Not Active") +
+   dashboard += "\n\n--- CLOSE MODE ---";
+   dashboard += "\nMode: " + closeMode;
+   dashboard += "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2);
+   dashboard += "\nTrail Level: " + ((gridPeakProfit >= GridTrailStart) ? DoubleToString(gridPeakProfit - GridTrailStep,2) : "Not Active");
 
-      "\n\n--- TRUE RECOVERY ---" +
-      "\nTrue Recovery Value: " + DoubleToString(trueRecovery,2) +
-      "\nFixed Target: " + DoubleToString(BasketProfit,2) +
+   dashboard += "\n\n--- TRUE RECOVERY ---";
+   dashboard += "\nTrue Recovery Value: " + DoubleToString(trueRecovery,2);
+   dashboard += "\nFixed Target: " + DoubleToString(BasketProfit,2);
 
-      "\n\n--- STATUS ---" +
-      "\nHedge Open: " + (IsHedgeOpen() ? "YES" : "NO") +
-      "\nHedge Triggered: " + (hedgeTriggeredThisCycle ? "YES" : "NO") +
-      "\nLoss Limit Waiting: " + (lossLimitHitWaitingForHedge ? "YES" : "NO") +
+   dashboard += "\n\n--- STATUS ---";
+   dashboard += "\nHedge Open: " + (IsHedgeOpen() ? "YES" : "NO");
+   dashboard += "\nHedge Triggered: " + (hedgeTriggeredThisCycle ? "YES" : "NO");
+   dashboard += "\nLoss Limit Waiting: " + (lossLimitHitWaitingForHedge ? "YES" : "NO");
 
-      "\n\nNOTE: DST automatically handled by MT5 broker time";
+   dashboard += "\n\nNOTE: DST automatically handled by MT5 broker time";
 
    Comment(dashboard);
 }
@@ -1487,13 +1439,6 @@ void OnTick()
       Dashboard();
 
       return;
-   }
-
-   // V6: MANUAL PAUSE CHECK (highest priority)
-   if(IsManuallyPaused())
-   {
-      Dashboard();  // Show paused status
-      return;        // Stop all trading logic
    }
 
    // V6: DAY FILTER CHECK
