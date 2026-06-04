@@ -967,87 +967,58 @@ void Dashboard()
    if(!dayAllowed) blockReasons += "\n  >> DAY RESTRICTED";
    if(manualPause) blockReasons += "\n  >> MANUALLY PAUSED";
 
-   Comment(
-      "GRID V6 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)\n",
-      "\n--- TIME FILTER ---",
-      "\nTime Filter: ", EnableTimeFilter ? "ENABLED" : "DISABLED",
-      "\nTrading Mode: ", modeName,
-      windowInfo,
-      "\nCurrent Time (MT5): ", currentTime, " (US EST/EDT)",
-      currentWindowInfo,
-      "\nTime Status: ", withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW",
+   // Build complete dashboard as single string
+   string dashboard =
+      "GRID V6 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)\n" +
+      "\n--- TIME FILTER ---" +
+      "\nTime Filter: " + (EnableTimeFilter ? "ENABLED" : "DISABLED") +
+      "\nTrading Mode: " + modeName +
+      windowInfo +
+      "\nCurrent Time (MT5): " + currentTime + " (US EST/EDT)" +
+      currentWindowInfo +
+      "\nTime Status: " + (withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW") +
 
-      "\n--- DAY FILTER ---",
-      "\nDay Filter: ", EnableDayFilter ? "ENABLED" : "DISABLED",
-      "\nToday: ", dayName, dayBestTag,
-      dayStatusInfo,
-      mondayInfo,
-      fridayInfo,
+      "\n--- DAY FILTER ---" +
+      "\nDay Filter: " + (EnableDayFilter ? "ENABLED" : "DISABLED") +
+      "\nToday: " + dayName + dayBestTag +
+      dayStatusInfo +
+      mondayInfo +
+      fridayInfo +
 
-      "\n--- MANUAL CONTROL ---",
-      "\nManual Pause: ", manualPause ? "ON (PAUSED)" : "OFF",
-      "\nControl: Press F3 > ", ManualPauseVarName,
-      pauseAction,
+      "\n--- MANUAL CONTROL ---" +
+      "\nManual Pause: " + (manualPause ? "ON (PAUSED)" : "OFF") +
+      "\nControl: Press F3 > " + ManualPauseVarName +
+      pauseAction +
 
-      "\n--- TRADING STATUS ---",
-      "\nOverall Status: ", (withinHours && dayAllowed && !manualPause) ? "TRADING ALLOWED" : "TRADING BLOCKED",
-      blockReasons,
+      "\n--- TRADING STATUS ---" +
+      "\nOverall Status: " + ((withinHours && dayAllowed && !manualPause) ? "TRADING ALLOWED" : "TRADING BLOCKED") +
+      blockReasons +
 
-      "\n\n--- INCREMENTAL GRID ---",
+      "\n\n--- INCREMENTAL GRID ---" +
+      "\nGrid Positions: " + IntegerToString(gridCount) +
+      "\nNext Grid Distance: " + IntegerToString(nextDistance) + " pts" +
+      "\nIncrement Step: " + IntegerToString(GridIncrementStep) +
 
-      "\nGrid Positions: ",
-      IntegerToString(gridCount),
+      "\n\n--- PROFIT/LOSS ---" +
+      "\nGrid Floating P/L: " + DoubleToString(gridProfit,2) +
 
-      "\nNext Grid Distance: ",
-      IntegerToString(nextDistance),
-      " pts",
+      "\n\n--- TRAILING STOP ---" +
+      "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2) +
+      "\nTrail Start: " + DoubleToString(GridTrailStart,2) +
+      "\nTrail Step: " + DoubleToString(GridTrailStep,2) +
+      "\nTrail Level: " + ((gridPeakProfit >= GridTrailStart) ? DoubleToString(gridPeakProfit - GridTrailStep,2) : "Not Active") +
 
-      "\nIncrement Step: ",
-      IntegerToString(GridIncrementStep),
+      "\n\n--- TARGETS ---" +
+      "\nProfit Target: " + DoubleToString(BasketProfit,2) +
+      "\nStop Loss: " + DoubleToString(BasketStopLoss,2) +
 
-      "\n\n--- PROFIT/LOSS ---",
+      "\n\n--- DIRECTION ---" +
+      "\nGrid Direction: " + ((currentDirection == 0) ? "BUY" : "SELL") +
+      "\nLoss Pause: " + ((PauseTradingUntil > 0 && TimeCurrent() < PauseTradingUntil) ? "YES (After Stop Loss)" : "NO") +
 
-      "\nGrid Floating P/L: ",
-      DoubleToString(gridProfit,2),
+      "\n\nNOTE: DST auto-handled by MT5 broker time";
 
-      "\n\n--- TRAILING STOP ---",
-
-      "\nGrid Peak Profit: ",
-      DoubleToString(gridPeakProfit,2),
-
-      "\nTrail Start: ",
-      DoubleToString(GridTrailStart,2),
-
-      "\nTrail Step: ",
-      DoubleToString(GridTrailStep,2),
-
-      "\nTrail Level: ",
-      (gridPeakProfit >= GridTrailStart)
-      ? DoubleToString(gridPeakProfit - GridTrailStep,2)
-      : "Not Active",
-
-      "\n\n--- TARGETS ---",
-
-      "\nProfit Target: ",
-      DoubleToString(BasketProfit,2),
-
-      "\nStop Loss: ",
-      DoubleToString(BasketStopLoss,2),
-
-      "\n\n--- DIRECTION ---",
-
-      "\nGrid Direction: ",
-      (currentDirection == 0)
-      ? "BUY"
-      : "SELL",
-
-      "\nLoss Pause: ",
-      (PauseTradingUntil > 0 && TimeCurrent() < PauseTradingUntil)
-      ? "YES (After Stop Loss)"
-      : "NO",
-
-      "\n\nNOTE: DST auto-handled by MT5 broker time"
-   );
+   Comment(dashboard);
 }
 
 //+------------------------------------------------------------------+
