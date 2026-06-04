@@ -46,7 +46,19 @@ Each file follows the pattern: `{Series}{Number}_{grid-type}_{hedge}_{pooling}_{
 | **B8_incr_nohedge_trail_time** | **Incremental** | **No** | **N/A** | **Yes** | **N/A** | **N/A** |
 | **B9_incr_hedge_pool_trail_time** | **Incremental** | **Yes** | **Yes** | **Yes** | **Yes** | **No** |
 
-**NEW:** B8 and B9 include automatic time filtering - they trade only during optimal hours (9:30-11:30 AM US time) with automatic DST handling.
+**NEW (V6):** B8 and B9 include **dual trading windows** with comprehensive filters:
+
+**Trading Modes:**
+- **MODE_DUAL_WINDOW** (DEFAULT): 3:00-7:30 AM + 9:30-11:30 AM US time (skips gap for optimal trading)
+- **MODE_OVERLAP_ONLY**: 9:30-11:30 AM US time (highest volatility period only)
+- **MODE_FULL_LONDON**: 3:00-11:30 AM US time (continuous window, includes gap)
+- **MODE_PEAK_HOUR**: 9:30-10:30 AM US time (ultra-conservative)
+- **MODE_CUSTOM**: User-defined hours
+
+**Additional V6 Features:**
+- **Day-of-Week Filter**: Skip Monday early trading, stop Friday late trading
+- **Manual Pause/Resume**: Control via global variables (Press F3 in MT5)
+- All features work year-round with automatic DST handling
 
 ---
 
@@ -220,32 +232,90 @@ This provides maximum flexibility to capture profits and minimize losses on hedg
 - MT5 display: US time (automatically adjusts for DST)
 - **You don't need to manually adjust for DST changes!**
 
-**Default Configuration:**
+#### Flexible Trading Modes (V6 Update)
+
+B8 and B9 now support **5 different trading modes** via dropdown selection:
+
+**1. MODE_DUAL_WINDOW (Default) ⭐ NEW**
 ```cpp
-EnableTimeFilter = true
-TradingStartHour = 9
-TradingStartMinute = 30
-TradingEndHour = 11
-TradingEndMinute = 30
-// Trades 9:30 AM - 11:30 AM US time (London-NY overlap)
+TradingMode = MODE_DUAL_WINDOW
+// Window 1: 3:00 AM - 7:30 AM (Early London - 4.5 hours)
+// GAP SKIPPED: 7:30 AM - 9:30 AM (No trading - 2 hours)
+// Window 2: 9:30 AM - 11:30 AM (London-NY Overlap - 2 hours)
+// Total: 6.5 hours of optimal trading
 ```
+- **When to use**: Best for data-driven optimal performance (DEFAULT for both B8 and B9)
+- **Benefits**:
+  - Captures BOTH high-quality sessions
+  - Skips the 7:30-9:30 AM gap period (lower quality trades)
+  - Based on tick data analysis showing optimal win rates
+  - 6.5 hours of targeted trading vs 8.5 hours continuous
+  - Works identically for summer (EDT) and winter (EST)
+- **Recommendation**: **DEFAULT - Best balance of trading time and quality**
 
-#### Time Windows in MT5 (US Time)
+**2. MODE_OVERLAP_ONLY**
+```cpp
+TradingMode = MODE_OVERLAP_ONLY
+// Trades 9:30 AM - 11:30 AM US time
+// Only London-NY Overlap (highest volatility window)
+```
+- **When to use**: Ultra-conservative, highest win rate approach
+- **Benefits**:
+  - Highest liquidity and volatility
+  - Clear directional trends
+  - Best win rate per data analysis (85-90%)
+  - 2 hours of peak quality trading only
+- **Recommendation**: **For maximum quality, minimum exposure**
 
-**Primary (Default): 9:30 AM - 11:30 AM**
-- London-NY Overlap
-- Highest liquidity and volatility
-- Best win rate per data analysis
-- **Recommended for B8 (no hedge)**
+**3. MODE_FULL_LONDON**
+```cpp
+TradingMode = MODE_FULL_LONDON
+// Trades 3:00 AM - 11:30 AM US time (continuous)
+// Includes the gap period (may have lower quality trades)
+```
+- **When to use**: When you want maximum trading opportunities
+- **Benefits**:
+  - Continuous trading window (no gaps)
+  - 8.5 hours of trading per day
+  - Good for hedge strategies that need more time
+- **Recommendation**: **For experienced traders who monitor constantly**
 
-**Secondary: 3:00 AM - 11:30 AM**
-- Full London session + overlap
-- Good for strategies with hedge protection
-- **Suitable for B9 (with hedge)**
+**4. MODE_PEAK_HOUR**
+```cpp
+TradingMode = MODE_PEAK_HOUR
+// Trades 9:30 AM - 10:30 AM US time
+// Only the first hour of overlap (most consistent)
+```
+- **When to use**: Ultra-conservative approach
+- **Benefits**:
+  - Lowest risk exposure
+  - Highest quality setups only
+  - 1 hour of peak trading
+- **Recommendation**: **For high-volatility days or conservative capital**
 
-**Conservative: 9:30 AM - 10:30 AM**
-- Peak hour only
-- Lowest risk, highest quality setups
+**5. MODE_CUSTOM**
+```cpp
+TradingMode = MODE_CUSTOM
+CustomStartHour = 9      // Set your own hours
+CustomStartMinute = 30
+CustomEndHour = 11
+CustomEndMinute = 30
+```
+- **When to use**: Advanced users with specific requirements
+- **Benefits**:
+  - Full control over trading window
+  - Test different time ranges
+- **Recommendation**: **For experienced traders only**
+
+#### Quick Mode Selection Guide
+
+| Strategy | Market Type | Recommended Mode | Trading Window (US Time) | Daily Hours |
+|----------|-------------|------------------|-------------------------|-------------|
+| **B8/B9** (General) | All Markets | MODE_DUAL_WINDOW ⭐ | 3:00-7:30 + 9:30-11:30 AM | 6.5 hours |
+| **B8** (Conservative) | Trending | MODE_OVERLAP_ONLY | 9:30-11:30 AM | 2 hours |
+| **B9** (Maximum) | Ranging | MODE_FULL_LONDON | 3:00-11:30 AM | 8.5 hours |
+| Any (Ultra-safe) | High Volatility | MODE_PEAK_HOUR | 9:30-10:30 AM | 1 hour |
+| Any (Advanced) | Custom Analysis | MODE_CUSTOM | User-defined | Variable |
 
 #### Automatic DST Handling
 
@@ -255,15 +325,23 @@ Since MT5 broker time shows US Eastern (EST/EDT), DST is handled automatically:
 Summer (March-October):
 - US observes EDT (UTC-4)
 - MT5 shows EDT
-- Your settings: 9:30-11:30 remain correct
+- MODE_FULL_LONDON: 3:00-11:30 AM remains correct
+- MODE_OVERLAP_ONLY: 9:30-11:30 AM remains correct
 
 Winter (November-February):
 - US observes EST (UTC-5)
 - MT5 shows EST
-- Your settings: 9:30-11:30 remain correct
+- MODE_FULL_LONDON: 3:00-11:30 AM remains correct
+- MODE_OVERLAP_ONLY: 9:30-11:30 AM remains correct
 
-NO MANUAL ADJUSTMENT NEEDED!
+NO MANUAL ADJUSTMENT NEEDED - ALL MODES WORK YEAR-ROUND!
 ```
+
+**Why This Works:**
+- London 8:00 AM opening = 3:00 AM US time (both EDT and EST)
+- London-NY overlap 9:30 AM = 9:30 AM US time (both EDT and EST)
+- MT5 automatically adjusts its clock for DST transitions
+- Your MODE selection works identically across all seasons
 
 #### Configuration Options
 
@@ -283,14 +361,84 @@ ClosePositionsOutsideHours = false
 
 #### Example: Your Laptop vs MT5
 
-**Your laptop time (IST):**
-- 8:00 PM IST = Evening in India
+**Scenario 1: MODE_FULL_LONDON**
+- **Your laptop**: 8:30 PM IST (evening in India)
+- **MT5 displays**:
+  - Summer: 10:00 AM EDT (within 3:00-11:30 window ✅)
+  - Winter: 10:00 AM EST (within 3:00-11:30 window ✅)
+- **Result**: EA trades during early London AND overlap
 
-**MT5 displays (US time):**
-- Summer: 10:30 AM EDT (within 9:30-11:30 window ✅)
-- Winter: 10:30 AM EST (within 9:30-11:30 window ✅)
+**Scenario 2: MODE_OVERLAP_ONLY**
+- **Your laptop**: 11:00 PM IST (late night in India)
+- **MT5 displays**:
+  - Summer: 12:30 PM EDT (outside 9:30-11:30 window ❌)
+  - Winter: 12:30 PM EST (outside 9:30-11:30 window ❌)
+- **Result**: EA stops trading after overlap ends
 
-**Result:** EA trades correctly regardless of season!
+**Key Insight:** EA trades correctly regardless of season because MT5 automatically handles DST!
+
+#### Day-of-Week Filter (V6 Feature) 📅
+
+B8 and B9 include smart day-of-week restrictions based on market behavior analysis:
+
+**Monday Restrictions:**
+```cpp
+SkipMondayEarly = true         // Skip Monday before this hour
+MondayStartHour = 15           // Start at 3:00 PM US time
+```
+- **Why**: Avoid post-weekend gap and low-quality early Monday trades
+- **Effect**: EA waits until 3:00 PM US time (8:30 PM IST summer / 9:30 PM IST winter) before trading
+- **Benefit**: Lets market settle after weekend, reduces false signals
+
+**Friday Restrictions:**
+```cpp
+StopFridayLate = true          // Stop Friday after this hour
+FridayEndHour = 21             // Stop at 9:00 PM US time
+```
+- **Why**: Avoid weekend risk and low-liquidity late Friday trades
+- **Effect**: EA stops opening new positions after 9:00 PM US time (2:30 AM IST Saturday)
+- **Benefit**: Reduces exposure to weekend gaps, protects capital
+
+**Best Trading Days:**
+- **Tuesday-Thursday**: Full trading without restrictions (most consistent price action)
+- These are highlighted as "BEST DAY" in the dashboard
+
+**How to Disable:**
+```cpp
+EnableDayFilter = false        // Disable all day restrictions (not recommended)
+```
+
+#### Manual Pause/Resume Control (V6 Feature) ⏸️
+
+Take full control of your EA with real-time pause/resume capability:
+
+**How It Works:**
+1. EA creates a global variable: `B8_ManualPause` or `B9_ManualPause`
+2. Press **F3** in MT5 to open Global Variables window
+3. Double-click the variable to change value:
+   - **0** = Resume Trading (EA active)
+   - **1** = Pause Trading (EA stops immediately)
+4. Changes take effect instantly - no need to restart EA
+
+**When to Use:**
+- **Before major news events**: NFP, FOMC, CPI releases
+- **During high volatility**: Unexpected market events
+- **Manual oversight**: When you want to observe without trading
+- **Testing/debugging**: Temporarily halt EA without removing from chart
+
+**Dashboard Display:**
+```
+--- MANUAL CONTROL ---
+Manual Pause: OFF
+Control: Press F3 > B8_ManualPause
+Set to 1 to PAUSE trading
+```
+
+**Important Notes:**
+- Pausing does NOT close existing positions - only stops new trades
+- Resume anytime by setting variable back to 0
+- Global variable persists across EA restarts
+- Each EA (B8/B9) has its own separate pause control
 
 #### Benefits
 
@@ -300,31 +448,72 @@ ClosePositionsOutsideHours = false
 4. **Automatic DST** - no manual intervention needed twice per year
 5. **Transparent** - Dashboard shows current time and window status
 
-#### Dashboard Display
+#### Dashboard Display (V6 Update)
+
+The dashboard shows comprehensive real-time information about all filters:
 
 ```
+GRID V6 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)
+
 --- TIME FILTER ---
 Time Filter: ENABLED
+Trading Mode: Dual Window
+Window 1: 03:00-07:30 (Early London)
+Window 2: 09:30-11:30 (Overlap)
+GAP SKIPPED: 07:30-09:30
 Current Time (MT5): 10:15:30 (US EST/EDT)
-Trading Window: 09:30 - 11:30
-Status: INSIDE WINDOW
-Trading Allowed: YES
+Current Window: Window 2 (Overlap)
+Time Status: INSIDE WINDOW
 
-NOTE: DST automatically handled by MT5 broker time
+--- DAY FILTER ---
+Day Filter: ENABLED
+Today: Thursday (BEST DAY)
+Day Status: ALLOWED
+
+--- MANUAL CONTROL ---
+Manual Pause: OFF
+Control: Press F3 > B8_ManualPause
+Set to 1 to PAUSE trading
+
+--- TRADING STATUS ---
+Overall Status: TRADING ALLOWED
 ```
 
-#### Comparison: B2 vs B8, B6 vs B9
+**V6 Dashboard Shows:**
+- **Trading Mode**: Which MODE is selected (Dual Window, Overlap Only, etc.)
+- **Window Details**: For dual window, shows both windows and gap period
+- **Current Window**: Which window you're currently in (Window 1 or Window 2)
+- **Time Status**: Whether current time is inside or outside trading windows
+- **Day Filter Status**: Current day and whether trading is allowed
+- **Manual Pause Status**: Whether EA is manually paused
+- **Overall Status**: Clear indication if trading is allowed or blocked (and why)
 
-| Feature | B2/B6 (No Filter) | B8/B9 (With Filter) |
-|---------|-------------------|---------------------|
-| Trading hours | 24/7 | 9:30-11:30 AM US time only |
+#### Comparison: B2 vs B8, B6 vs B9 (V6 Features)
+
+| Feature | B2/B6 (No Filter) | B8/B9 (V6 With Filters) |
+|---------|-------------------|-------------------------|
+| Trading hours | 24/7 | Flexible (1-8.5 hours based on MODE) |
+| Trading modes | None | 5 modes (V6: Dual Window, Overlap, Full London, Peak, Custom) |
+| Dual window | ❌ No | ✅ Yes (V6: skips gap period) |
 | Asian session | ✅ Trades (choppy) | ❌ Skips (prevents losses) |
-| London-NY overlap | ✅ Trades | ✅ Trades (optimal) |
-| DST adjustment | Manual | Automatic |
-| Win rate | Lower (all sessions) | Higher (best session only) |
-| Drawdown frequency | Higher | Lower |
+| London early | ✅ Trades | ✅ Trades (MODE_DUAL_WINDOW Window 1) |
+| Gap period (7:30-9:30) | ✅ Trades | ❌ Skips (MODE_DUAL_WINDOW) |
+| London-NY overlap | ✅ Trades | ✅ Trades (all modes) |
+| Day filter | ❌ No | ✅ Yes (V6: Monday/Friday restrictions) |
+| Manual pause | ❌ No | ✅ Yes (V6: F3 global variable control) |
+| DST adjustment | Manual | Automatic (year-round) |
+| Win rate | Lower (all sessions) | Higher (V6: targeted sessions + day filter) |
+| Drawdown frequency | Higher | Lower (V6: better entry timing) |
+| Flexibility | None | Very High (V6: 5 modes + day + manual) |
+| Best for | 24/7 monitoring | Strategic time-based trading with full control |
 
-**Recommendation:** Use B8/B9 for **consistent, data-driven performance** during proven high-win-rate hours.
+**Recommendation:** Use B8/B9 (V6) for **optimal data-driven performance** with maximum control.
+
+**V6 Mode Recommendations:**
+- **B8/B9 (Default)**: Use MODE_DUAL_WINDOW for best balance (6.5 hours/day, skips gap)
+- **B8 (Conservative)**: Use MODE_OVERLAP_ONLY for highest win rate (2 hours/day)
+- **B9 (Maximum)**: Use MODE_FULL_LONDON for full session coverage (8.5 hours/day)
+- **Any (Manual Control)**: Use day filter + manual pause for news events
 
 ---
 
@@ -1085,13 +1274,40 @@ During March and November, there are brief periods when one market has switched 
   - Fixed critical bug where grid trailing stop never triggered
   - Corrected logic: grid trail only applies when hedge NOT triggered
   - 14 total strategy variations
-- **v5 (Current)**: Added B8 and B9 with automatic time filtering
-  - **B8**: Incremental + No Hedge + Trail + Time Filter
-  - **B9**: Incremental + Hedge + Pool + Trail + Time Filter
-  - Trades only during optimal hours (9:30-11:30 AM US time)
-  - Automatic DST handling via MT5 broker time
-  - Based on tick data analysis showing 85-90% win rate during London-NY overlap
-  - 16 total strategy variations now available
+- **v5**: Added B8 and B9 with time filtering (4 modes, auto DST handling)
+- **v6 (Current)**: Enhanced B8 and B9 with comprehensive filters and controls
+  - **B8**: Incremental + No Hedge + Trail + Time Filter + Day Filter + Manual Pause
+  - **B9**: Incremental + Hedge + Pool + Trail + Time Filter + Day Filter + Manual Pause
+  - **NEW: Dual Trading Window (MODE_DUAL_WINDOW)**:
+    - Window 1: 3:00-7:30 AM US time (Early London - 4.5 hours)
+    - GAP SKIPPED: 7:30-9:30 AM US time (2 hours of lower quality trades)
+    - Window 2: 9:30-11:30 AM US time (London-NY Overlap - 2 hours)
+    - Total: 6.5 hours of optimal data-driven trading
+    - Set as DEFAULT mode for both B8 and B9
+  - **NEW: 5 Trading Modes** (added Dual Window to existing 4):
+    - MODE_DUAL_WINDOW (NEW DEFAULT): Skips gap, trades 6.5 hours optimally
+    - MODE_OVERLAP_ONLY: 9:30-11:30 AM (highest volatility, 2 hours)
+    - MODE_FULL_LONDON: 3:00-11:30 AM (continuous 8.5 hours, includes gap)
+    - MODE_PEAK_HOUR: 9:30-10:30 AM (ultra-conservative, 1 hour)
+    - MODE_CUSTOM: User-defined hours
+  - **NEW: Day-of-Week Filter**:
+    - Skip Monday early trading (default: before 3:00 PM US / after weekend gap)
+    - Stop Friday late trading (default: after 9:00 PM US / before weekend)
+    - Tuesday-Thursday flagged as "BEST DAYS" in dashboard
+    - Configurable or can be disabled
+  - **NEW: Manual Pause/Resume Control**:
+    - Real-time control via global variables (F3 in MT5)
+    - B8_ManualPause / B9_ManualPause variables
+    - Instant pause/resume without restarting EA
+    - Perfect for news events (NFP, FOMC, CPI)
+  - **Enhanced Dashboard** showing:
+    - Current trading window (Window 1 or Window 2 for dual mode)
+    - Day filter status and restrictions
+    - Manual pause status with control instructions
+    - Overall trading status (allowed/blocked with reasons)
+  - All features work year-round with automatic DST handling
+  - Based on tick data analysis optimizing for win rate and capital efficiency
+  - 16 total strategy variations available
 
 ---
 
