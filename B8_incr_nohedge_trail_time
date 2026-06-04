@@ -935,70 +935,63 @@ void Dashboard()
       default: dayName = "Unknown"; break;
    }
 
+   // Build strings beforehand to avoid Comment() parameter count issues
+   string windowInfo = "";
+   if(TradingMode == MODE_DUAL_WINDOW)
+      windowInfo = "\nWindow 1: 03:00-07:30 (Early London)\nWindow 2: 09:30-11:30 (Overlap)\nGAP SKIPPED: 07:30-09:30";
+
+   string currentWindowInfo = "";
+   if(TradingMode == MODE_DUAL_WINDOW && currentWindow != "")
+      currentWindowInfo = "\nCurrent Window: " + currentWindow;
+
+   string dayBestTag = "";
+   if(dt.day_of_week >= 2 && dt.day_of_week <= 4)
+      dayBestTag = " (BEST DAY)";
+
+   string dayStatusInfo = "";
+   if(EnableDayFilter)
+      dayStatusInfo = "\nDay Status: " + (dayAllowed ? "ALLOWED" : "RESTRICTED");
+
+   string mondayInfo = "";
+   if(dt.day_of_week == 1 && SkipMondayEarly)
+      mondayInfo = StringFormat("\nMonday Skip: Before %02d:00", MondayStartHour);
+
+   string fridayInfo = "";
+   if(dt.day_of_week == 5 && StopFridayLate)
+      fridayInfo = StringFormat("\nFriday Stop: After %02d:00", FridayEndHour);
+
+   string pauseAction = manualPause ? "\nSet to 0 to RESUME trading" : "\nSet to 1 to PAUSE trading";
+
+   string blockReasons = "";
+   if(!withinHours) blockReasons += "\n  >> OUTSIDE TIME WINDOW";
+   if(!dayAllowed) blockReasons += "\n  >> DAY RESTRICTED";
+   if(manualPause) blockReasons += "\n  >> MANUALLY PAUSED";
+
    Comment(
       "GRID V6 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)\n",
-
       "\n--- TIME FILTER ---",
-
-      "\nTime Filter: ",
-      EnableTimeFilter ? "ENABLED" : "DISABLED",
-
-      "\nTrading Mode: ",
-      modeName,
-
-      (TradingMode == MODE_DUAL_WINDOW) ?
-      "\nWindow 1: 03:00-07:30 (Early London)\nWindow 2: 09:30-11:30 (Overlap)\nGAP SKIPPED: 07:30-09:30" :
-      StringFormat("\nTrading Window: %02d:%02d - %02d:%02d", 3, 0, 11, 30),
-
-      "\nCurrent Time (MT5): ",
-      currentTime,
-      " (US EST/EDT)",
-
-      (TradingMode == MODE_DUAL_WINDOW && currentWindow != "") ?
-      StringFormat("\nCurrent Window: %s", currentWindow) : "",
-
-      "\nTime Status: ",
-      withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW",
+      "\nTime Filter: ", EnableTimeFilter ? "ENABLED" : "DISABLED",
+      "\nTrading Mode: ", modeName,
+      windowInfo,
+      "\nCurrent Time (MT5): ", currentTime, " (US EST/EDT)",
+      currentWindowInfo,
+      "\nTime Status: ", withinHours ? "INSIDE WINDOW" : "OUTSIDE WINDOW",
 
       "\n--- DAY FILTER ---",
-
-      "\nDay Filter: ",
-      EnableDayFilter ? "ENABLED" : "DISABLED",
-
-      "\nToday: ",
-      dayName,
-
-      (dt.day_of_week >= 2 && dt.day_of_week <= 4) ? " (BEST DAY)" : "",
-
-      EnableDayFilter ? "\nDay Status: " : "",
-      EnableDayFilter ? (dayAllowed ? "ALLOWED" : "RESTRICTED") : "",
-
-      (dt.day_of_week == 1 && SkipMondayEarly) ?
-      StringFormat("\nMonday Skip: Before %02d:00", MondayStartHour) : "",
-
-      (dt.day_of_week == 5 && StopFridayLate) ?
-      StringFormat("\nFriday Stop: After %02d:00", FridayEndHour) : "",
+      "\nDay Filter: ", EnableDayFilter ? "ENABLED" : "DISABLED",
+      "\nToday: ", dayName, dayBestTag,
+      dayStatusInfo,
+      mondayInfo,
+      fridayInfo,
 
       "\n--- MANUAL CONTROL ---",
-
-      "\nManual Pause: ",
-      manualPause ? "ON (PAUSED)" : "OFF",
-
-      "\nControl: Press F3 > ",
-      ManualPauseVarName,
-
-      manualPause ?
-      "\nSet to 0 to RESUME trading" :
-      "\nSet to 1 to PAUSE trading",
+      "\nManual Pause: ", manualPause ? "ON (PAUSED)" : "OFF",
+      "\nControl: Press F3 > ", ManualPauseVarName,
+      pauseAction,
 
       "\n--- TRADING STATUS ---",
-
-      "\nOverall Status: ",
-      (withinHours && dayAllowed && !manualPause) ? "TRADING ALLOWED" : "TRADING BLOCKED",
-
-      !withinHours ? "\n  >> OUTSIDE TIME WINDOW" : "",
-      !dayAllowed ? "\n  >> DAY RESTRICTED" : "",
-      manualPause ? "\n  >> MANUALLY PAUSED" : "",
+      "\nOverall Status: ", (withinHours && dayAllowed && !manualPause) ? "TRADING ALLOWED" : "TRADING BLOCKED",
+      blockReasons,
 
       "\n\n--- INCREMENTAL GRID ---",
 
