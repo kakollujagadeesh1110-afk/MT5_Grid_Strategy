@@ -170,9 +170,9 @@ int OnInit()
 
       if(TradingMode == MODE_DUAL_WINDOW)
       {
-         Print("  Window 1: 11:00 - 15:30 (Early London)");
-         Print("  Window 2: 17:30 - 19:30 (London-NY Overlap)");
-         Print("  GAP SKIPPED: 15:30 - 17:30 (No trading)");
+         Print("  Window 1: 11:00 - 15:30 UTC+3 (Early London)");
+         Print("  Window 2: 17:30 - 19:30 UTC+3 (London-NY Overlap)");
+         Print("  GAP SKIPPED: 15:30 - 17:30 UTC+3 (No trading)");
       }
       else
       {
@@ -1339,7 +1339,7 @@ void Dashboard()
    // Build strings beforehand to avoid Comment() parameter count issues
    string windowInfo = "";
    if(TradingMode == MODE_DUAL_WINDOW)
-      windowInfo = "\nWindow 1: 03:00-07:30 (Early London)\nWindow 2: 09:30-11:30 (Overlap)\nGAP SKIPPED: 07:30-09:30";
+      windowInfo = "\nWindow 1: 11:00-15:30 UTC+3 (Early London)\nWindow 2: 17:30-19:30 UTC+3 (Overlap)\nGAP SKIPPED: 15:30-17:30 UTC+3";
 
    string currentWindowInfo = "";
    if(TradingMode == MODE_DUAL_WINDOW && currentWindow != "")
