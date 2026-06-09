@@ -1,12 +1,16 @@
 //+------------------------------------------------------------------+
-//|            XAUUSD GRID ENGINE (NO HEDGE) + TIME FILTER           |
-//|         VERSION 6: INCREMENTAL GRID - NO HEDGE - TIME FILTERED   |
+//|            XAUUSD GRID + SMART HEDGE ENGINE + TIME FILTER        |
+//|         VERSION 7: INCREMENTAL GRID + HEDGE + TIME FILTERED      |
 //|         - Incremental grid distance (200×N)                      |
-//|         - NO hedging - pure grid                                 |
-//|         - Grid trailing stop for profit                          |
-//|         - Stop loss at $150 closes all                           |
-//|         - DUAL WINDOW: Early London + Overlap (skips gap)        |
-//|         - DAY FILTER: Monday/Friday restrictions                 |
+//|         - Hedge at trigger loss                                  |
+//|         - Grid trailing stop (disabled when hedge triggers)      |
+//|         - Profit pooling                                         |
+//|         - DAY-AWARE DUAL WINDOW:                                 |
+//|           * Monday: 05:00-15:30 + 17:30-19:30 (Extended W1)      |
+//|           * Tue-Fri: 11:00-15:30 + 17:30-19:30 (Standard)        |
+//|           * Saturday: 00:00-01:00 (Before market close)          |
+//|           * Sunday: NO TRADING (Market closed)                   |
+//|         - GAP SKIPPED: 15:30-17:30 UTC+3 (All days)              |
 //|         - AUTO DST HANDLING: Works with MT5 broker time          |
 //+------------------------------------------------------------------+
 #property strict
@@ -16,7 +20,7 @@ CTrade trade;
 
 //========================= INPUTS ==================================//
 
-input ulong  MagicNumber              = 26052508;
+input ulong  MagicNumber              = 26052509;
 
 //---------------- GRID ----------------//
 
@@ -27,7 +31,7 @@ input int    MaxTrades                = 50;
 //---------------- BASKET --------------//
 
 input double BasketProfit             = 10.0;
-input double BasketStopLoss           = -150.0; // V4b: Stop loss - closes all at this loss
+input double BasketLossLimit          = -320.0;
 
 input int    RestartAfterHours        = 2;
 
@@ -35,6 +39,20 @@ input int    RestartAfterHours        = 2;
 
 input double GridTrailStart           = 20.0;   // Start trailing after this profit
 input double GridTrailStep            = 10.0;   // Close if profit drops this much from peak
+
+//---------------- HEDGE ---------------//
+
+input bool   EnableHedge              = true;
+
+input double HedgeTriggerUSD          = 150.0;  // Hedge triggers at this loss
+input double HedgeLot                 = 0.05;
+
+input double HedgeFixedLossUSD        = 75.0;
+
+input double HedgeTrailStart          = 20.0;
+input double HedgeTrailStep           = 10.0;
+
+input int    HedgeCloseDeviation      = 500;
 
 //---------------- TIME FILTER (V6) ----------------//
 // MT5 shows UTC+3 time - DST handled automatically by broker
@@ -71,13 +89,13 @@ input bool   ClosePositionsOutsideHours = false; // Close all if outside trading
 
 input bool   EnableDayFilter          = true;   // Enable day-of-week restrictions
 
-// Monday Settings (avoid early trading after weekend gap)
-input bool   SkipMondayEarly          = true;   // Skip Monday before this hour
-input int    MondayStartHour          = 23;     // Monday start at 11:00 PM UTC+3 (after gap settlement)
+// Monday Settings (extended Window 1 start after weekend gap settlement)
+input bool   SkipMondayEarly          = false;  // Not used - Monday handled by extended time window
+input int    MondayStartHour          = 5;      // Monday Window 1 starts at 05:00 UTC+3 (after 4hr gap settlement)
 
-// Friday/Saturday Settings (avoid late trading before weekend)
-input bool   StopFridayLate           = true;   // Stop Saturday morning after this hour
-input int    FridayEndHour            = 5;      // Saturday stop at 05:00 AM UTC+3 (Friday 9 PM US = Sat 5 AM UTC+3)
+// Friday/Saturday Settings (market closes Saturday 01:00 UTC+3)
+input bool   StopFridayLate           = true;   // Stop Saturday after market close
+input int    FridayEndHour            = 1;      // Saturday stop at 01:00 AM UTC+3 (market close)
 
 //---------------- SAFETY --------------//
 
@@ -93,14 +111,34 @@ input int    TradeCooldownSeconds     = 3;
 
 int currentDirection = -1;
 
+double realizedHedgeLoss = 0.0;
+
+double realizedHedgeProfit = 0.0;
+
+double hedgePeakProfit = 0.0;
+
 double gridPeakProfit = 0.0;
 
+ENUM_ORDER_TYPE hedgeSignalType;
+
 datetime PauseTradingUntil = 0;
+
+double lastHedgeOpenPrice = 0.0;
 
 datetime lastTradeTime = 0;
 
 bool closeAllPending = false;
 bool closeAfterLoss  = false;
+
+//--- FLAGS FOR GRID/HEDGE CONTROL ---//
+
+bool hedgeTriggeredThisCycle = false;
+
+bool lastHedgeWasLoss = false;
+
+ENUM_ORDER_TYPE lastHedgeType;
+
+bool lossLimitHitWaitingForHedge = false;
 
 //+------------------------------------------------------------------+
 //| INIT                                                             |
@@ -136,9 +174,11 @@ int OnInit()
 
       if(TradingMode == MODE_DUAL_WINDOW)
       {
-         Print("  Window 1: 11:00 - 15:30 UTC+3 (Early London)");
-         Print("  Window 2: 17:30 - 19:30 UTC+3 (London-NY Overlap)");
-         Print("  GAP SKIPPED: 15:30 - 17:30 UTC+3 (No trading)");
+         Print("  MONDAY:    05:00-15:30 + 17:30-19:30 UTC+3 (Extended W1)");
+         Print("  TUE-FRI:   11:00-15:30 + 17:30-19:30 UTC+3 (Standard)");
+         Print("  SATURDAY:  00:00-01:00 UTC+3 (Before market close)");
+         Print("  SUNDAY:    NO TRADING (Market closed)");
+         Print("  GAP SKIPPED: 15:30 - 17:30 UTC+3 (All days)");
       }
       else
       {
@@ -160,11 +200,11 @@ int OnInit()
    if(EnableDayFilter)
    {
       Print("=== DAY FILTER: ENABLED ===");
-      if(SkipMondayEarly)
-         Print("  Monday: Skip until ", IntegerToString(MondayStartHour, 2, '0'), ":00 UTC+3");
+      Print("  Sunday: NO TRADING (Market closed)");
+      Print("  Monday: Extended Window 1 from ", IntegerToString(MondayStartHour, 2, '0'), ":00 UTC+3");
       if(StopFridayLate)
-         Print("  Saturday: Stop after ", IntegerToString(FridayEndHour, 2, '0'), ":00 UTC+3");
-      Print("  Best Days: Tuesday-Thursday");
+         Print("  Saturday: Market closes at ", IntegerToString(FridayEndHour, 2, '0'), ":00 UTC+3");
+      Print("  Best Days: Tuesday-Thursday (Full sessions)");
    }
    else
    {
@@ -234,9 +274,9 @@ void GetTradingHours(int &startHour, int &startMin, int &endHour, int &endMin)
 }
 
 //+------------------------------------------------------------------+
-//| V6: CHECK IF WITHIN TRADING HOURS                                |
+//| V7: CHECK IF WITHIN TRADING HOURS                                |
 //| MT5 broker time shows UTC+3 with auto DST handling               |
-//| V6: Handles dual window mode (2 separate windows with gap)      |
+//| V7: Day-aware dual window mode with Monday/Saturday handling     |
 //+------------------------------------------------------------------+
 bool IsWithinTradingHours()
 {
@@ -248,9 +288,34 @@ bool IsWithinTradingHours()
 
    int currentMinutes = dt.hour * 60 + dt.min;
 
-   // V6: Special handling for MODE_DUAL_WINDOW
+   // V7: Special handling for MODE_DUAL_WINDOW with day-specific windows
    if(TradingMode == MODE_DUAL_WINDOW)
    {
+      // SATURDAY: Special window before market close (00:00-01:00 UTC+3)
+      if(dt.day_of_week == 6)
+      {
+         int saturdayEnd = FridayEndHour * 60;  // 01:00 = 60 minutes
+         return (currentMinutes < saturdayEnd);
+      }
+
+      // MONDAY: Extended Window 1 (starts at 05:00 instead of 11:00)
+      if(dt.day_of_week == 1)
+      {
+         // Window 1: 05:00 - 15:30 (Monday extended after gap settlement)
+         int window1Start = MondayStartHour * 60 + 0;  // 05:00 = 300 minutes
+         int window1End = 15 * 60 + 30;                // 15:30 = 930 minutes
+
+         // Window 2: 17:30 - 19:30 (same as other days)
+         int window2Start = 17 * 60 + 30;    // 1050 minutes
+         int window2End = 19 * 60 + 30;      // 1170 minutes
+
+         bool inWindow1 = (currentMinutes >= window1Start) && (currentMinutes <= window1End);
+         bool inWindow2 = (currentMinutes >= window2Start) && (currentMinutes <= window2End);
+
+         return inWindow1 || inWindow2;
+      }
+
+      // TUESDAY-FRIDAY: Standard dual window
       // Window 1: 11:00 - 15:30 (Early London)
       int window1Start = 11 * 60 + 0;    // 660 minutes
       int window1End = 15 * 60 + 30;      // 930 minutes
@@ -287,9 +352,9 @@ bool IsWithinTradingHours()
 }
 
 //+------------------------------------------------------------------+
-//| V6: CHECK DAY-OF-WEEK FILTER                                     |
-//| Returns true if trading allowed based on day/time restrictions  |
-//| NOTE: UTC+3 timezone - Friday 21:00 US = Saturday 05:00 UTC+3   |
+//| V7: CHECK DAY-OF-WEEK FILTER                                     |
+//| Returns true if trading allowed based on day restrictions        |
+//| NOTE: Monday/Saturday timing handled by IsWithinTradingHours()   |
 //+------------------------------------------------------------------+
 bool IsTradingDayAllowed()
 {
@@ -301,28 +366,20 @@ bool IsTradingDayAllowed()
 
    // dt.day_of_week: 0=Sunday, 1=Monday, 2=Tuesday, ..., 6=Saturday
 
-   // Monday restrictions (skip before 23:00 UTC+3 = before 15:00 US Monday)
-   if(dt.day_of_week == 1 && SkipMondayEarly)
-   {
-      // It's Monday, check if before allowed start hour
-      if(dt.hour < MondayStartHour)
-         return false;  // Too early on Monday
-   }
+   // Sunday - no trading (market closed)
+   if(dt.day_of_week == 0)
+      return false;
 
-   // Saturday restrictions (stop after 05:00 UTC+3 = after 21:00 US Friday)
-   // Allow Saturday early morning (00:00-04:59 UTC+3 = Friday evening US)
+   // Saturday - check if market is still open (closes at 01:00 UTC+3)
+   // Time window check is in IsWithinTradingHours(), but block entirely after market close
    if(dt.day_of_week == 6 && StopFridayLate)
    {
-      // It's Saturday, check if after stop hour
       if(dt.hour >= FridayEndHour)
-         return false;  // Too late - Friday evening ended in US
+         return false;  // Market closed
    }
 
-   // Sunday - no trading
-   if(dt.day_of_week == 0)
-      return false;  // No trading on Sunday
-
-   return true;  // All checks passed
+   // Monday-Friday: Allow (time windows handled by IsWithinTradingHours)
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -380,6 +437,21 @@ bool IsGridPosition()
 
    if(c == "GridBuy"
       || c == "GridSell")
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| IS HEDGE POSITION                                                |
+//+------------------------------------------------------------------+
+bool IsHedgePosition()
+{
+   if(!IsOurPosition())
+      return false;
+
+   if(PositionGetString(POSITION_COMMENT)
+      == "HEDGE")
       return true;
 
    return false;
@@ -517,7 +589,35 @@ int TotalGridPositions()
 }
 
 //+------------------------------------------------------------------+
-//| GET GRID PROFIT                                                  |
+//| TOTAL PROFIT (Floating P/L of all open positions)                |
+//+------------------------------------------------------------------+
+double GetTotalProfit()
+{
+   double profit = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsOurPosition())
+         continue;
+
+      profit +=
+      PositionGetDouble(POSITION_PROFIT);
+
+      profit +=
+      PositionGetDouble(POSITION_SWAP);
+   }
+
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| GRID PROFIT ONLY                                                 |
 //+------------------------------------------------------------------+
 double GetGridProfit()
 {
@@ -542,6 +642,58 @@ double GetGridProfit()
    }
 
    return profit;
+}
+
+//+------------------------------------------------------------------+
+//| TRUE RECOVERY VALUE                                              |
+//+------------------------------------------------------------------+
+double GetTrueRecoveryValue()
+{
+   double floatingPL = GetTotalProfit();
+
+   double netRealizedHedge = realizedHedgeProfit - realizedHedgeLoss;
+
+   return floatingPL + netRealizedHedge;
+}
+
+//+------------------------------------------------------------------+
+//| HEDGE OPEN CHECK                                                 |
+//+------------------------------------------------------------------+
+bool IsHedgeOpen()
+{
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(IsHedgePosition())
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE ONLY GRID POSITIONS                                        |
+//+------------------------------------------------------------------+
+void CloseOnlyGridPositions()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      trade.PositionClose(ticket);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -599,6 +751,7 @@ int GetIncrementalGridDistance()
 {
    int gridCount = TotalGridPositions();
 
+   // If no grid yet, first distance is 1 × Step
    if(gridCount == 0)
       gridCount = 1;
 
@@ -610,7 +763,287 @@ int GetIncrementalGridDistance()
 //+------------------------------------------------------------------+
 void ResetEngine()
 {
+   realizedHedgeLoss = 0.0;
+
+   realizedHedgeProfit = 0.0;
+
+   hedgePeakProfit = 0.0;
+
    gridPeakProfit = 0.0;
+
+   lastHedgeOpenPrice = 0.0;
+
+   hedgeTriggeredThisCycle = false;
+   lastHedgeWasLoss = false;
+   lossLimitHitWaitingForHedge = false;
+}
+
+//+------------------------------------------------------------------+
+//| PREPARE HEDGE                                                    |
+//+------------------------------------------------------------------+
+void PrepareHedge()
+{
+   double buyLots = 0.0;
+   double sellLots = 0.0;
+
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsGridPosition())
+         continue;
+
+      double lot =
+      PositionGetDouble(POSITION_VOLUME);
+
+      if(PositionGetInteger(POSITION_TYPE)
+         == POSITION_TYPE_BUY)
+      {
+         buyLots += lot;
+      }
+      else
+      {
+         sellLots += lot;
+      }
+   }
+
+   if(buyLots > sellLots)
+      hedgeSignalType = ORDER_TYPE_SELL;
+   else
+      hedgeSignalType = ORDER_TYPE_BUY;
+}
+
+//+------------------------------------------------------------------+
+//| OPEN AUTO HEDGE                                                  |
+//+------------------------------------------------------------------+
+void OpenAutoHedge()
+{
+   if(!EnableHedge)
+      return;
+
+   if(IsHedgeOpen())
+      return;
+
+   if(!MarginOK())
+      return;
+
+   double ask =
+   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   double bid =
+   SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   bool result = false;
+
+   hedgePeakProfit = 0.0;
+
+   double lot =
+   NormalizeLot(HedgeLot);
+
+   trade.SetDeviationInPoints(HedgeCloseDeviation);
+
+   if(hedgeSignalType == ORDER_TYPE_BUY)
+   {
+      result =
+      trade.Buy(
+         lot,
+         _Symbol,
+         ask,
+         0,
+         0,
+         "HEDGE"
+      );
+
+      if(result)
+      {
+         lastHedgeOpenPrice = ask;
+         hedgeTriggeredThisCycle = true;
+         lastHedgeType = ORDER_TYPE_BUY;
+         lastHedgeWasLoss = false;
+      }
+   }
+   else
+   {
+      result =
+      trade.Sell(
+         lot,
+         _Symbol,
+         bid,
+         0,
+         0,
+         "HEDGE"
+      );
+
+      if(result)
+      {
+         lastHedgeOpenPrice = bid;
+         hedgeTriggeredThisCycle = true;
+         lastHedgeType = ORDER_TYPE_SELL;
+         lastHedgeWasLoss = false;
+      }
+   }
+
+   trade.SetDeviationInPoints(20);
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE POSITION + REALIZED PL                                     |
+//+------------------------------------------------------------------+
+bool ClosePositionGetPL(
+   ulong ticket,
+   double &realizedPL
+)
+{
+   realizedPL = 0.0;
+
+   trade.SetDeviationInPoints(HedgeCloseDeviation);
+
+   bool result =
+   trade.PositionClose(ticket);
+
+   trade.SetDeviationInPoints(20);
+
+   if(!result)
+      return false;
+
+   ulong deal =
+   trade.ResultDeal();
+
+   if(deal > 0
+      && HistoryDealSelect(deal))
+   {
+      realizedPL =
+      HistoryDealGetDouble(
+         deal,
+         DEAL_PROFIT
+      );
+
+      realizedPL +=
+      HistoryDealGetDouble(
+         deal,
+         DEAL_SWAP
+      );
+
+      realizedPL +=
+      HistoryDealGetDouble(
+         deal,
+         DEAL_COMMISSION
+      );
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE SMART HEDGE                                               |
+//+------------------------------------------------------------------+
+void ManageSmartHedge()
+{
+   if(!EnableHedge)
+      return;
+
+   double gridLoss =
+   MathMax(0,-GetGridProfit());
+
+   if(!IsHedgeOpen()
+      && gridLoss >= HedgeTriggerUSD)
+   {
+      if(lastHedgeWasLoss && lastHedgeOpenPrice > 0)
+      {
+         double ask =
+         SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+         double bid =
+         SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+         bool priceReturned = false;
+
+         if(lastHedgeType == ORDER_TYPE_SELL)
+         {
+            if(ask >= lastHedgeOpenPrice)
+               priceReturned = true;
+         }
+         else if(lastHedgeType == ORDER_TYPE_BUY)
+         {
+            if(bid <= lastHedgeOpenPrice)
+               priceReturned = true;
+         }
+
+         if(!priceReturned)
+            return;
+      }
+
+      PrepareHedge();
+
+      OpenAutoHedge();
+
+      return;
+   }
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket =
+      PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(!IsHedgePosition())
+         continue;
+
+      double profit =
+      PositionGetDouble(POSITION_PROFIT);
+
+      if(profit <= -HedgeFixedLossUSD)
+      {
+         double realized = 0.0;
+
+         if(ClosePositionGetPL(ticket,realized))
+         {
+            realizedHedgeLoss +=
+            MathAbs(realized);
+
+            hedgePeakProfit = 0.0;
+
+            lastHedgeWasLoss = true;
+         }
+
+         return;
+      }
+
+      if(profit > hedgePeakProfit)
+         hedgePeakProfit = profit;
+
+      if(hedgePeakProfit >= HedgeTrailStart)
+      {
+         double trailLevel =
+         hedgePeakProfit
+         - HedgeTrailStep;
+
+         if(profit <= trailLevel)
+         {
+            double realized = 0.0;
+
+            if(ClosePositionGetPL(ticket,realized))
+            {
+               hedgePeakProfit = 0.0;
+
+               if(realized > 0)
+                  realizedHedgeProfit += realized;
+               else
+                  realizedHedgeLoss += MathAbs(realized);
+
+               lastHedgeWasLoss = false;
+            }
+
+            return;
+         }
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -618,6 +1051,12 @@ void ResetEngine()
 //+------------------------------------------------------------------+
 void ManageGrid()
 {
+   if(IsHedgeOpen())
+      return;
+
+   if(hedgeTriggeredThisCycle)
+      return;
+
    if(!SpreadOK())
       return;
 
@@ -720,6 +1159,12 @@ void ManageGrid()
 //+------------------------------------------------------------------+
 void OpenFirstTrade()
 {
+   if(IsHedgeOpen())
+      return;
+
+   if(hedgeTriggeredThisCycle)
+      return;
+
    if(!AllowTrading())
       return;
 
@@ -825,16 +1270,19 @@ void ProcessCloseAll()
 //+------------------------------------------------------------------+
 bool CheckGridTrailingStop()
 {
-   double gridProfit = GetGridProfit();
+   if(hedgeTriggeredThisCycle)
+      return false;
 
-   if(gridProfit > gridPeakProfit)
-      gridPeakProfit = gridProfit;
+   double trueRecovery = GetTrueRecoveryValue();
+
+   if(trueRecovery > gridPeakProfit)
+      gridPeakProfit = trueRecovery;
 
    if(gridPeakProfit >= GridTrailStart)
    {
       double trailLevel = gridPeakProfit - GridTrailStep;
 
-      if(gridProfit <= trailLevel)
+      if(trueRecovery <= trailLevel)
          return true;
    }
 
@@ -846,8 +1294,14 @@ bool CheckGridTrailingStop()
 //+------------------------------------------------------------------+
 void Dashboard()
 {
-   double gridProfit =
-   GetGridProfit();
+   double totalFloating =
+   GetTotalProfit();
+
+   double trueRecovery =
+   GetTrueRecoveryValue();
+
+   double netRealizedHedge =
+   realizedHedgeProfit - realizedHedgeLoss;
 
    int gridCount = TotalGridPositions();
    int nextDistance = GetIncrementalGridDistance();
@@ -857,6 +1311,10 @@ void Dashboard()
    string currentTime = StringFormat("%02d:%02d:%02d", dt.hour, dt.min, dt.sec);
 
    bool withinHours = IsWithinTradingHours();
+
+   int startHour, startMin, endHour, endMin;
+   GetTradingHours(startHour, startMin, endHour, endMin);
+
    bool dayAllowed = IsTradingDayAllowed();
 
    string modeName;
@@ -875,10 +1333,22 @@ void Dashboard()
    if(TradingMode == MODE_DUAL_WINDOW && withinHours)
    {
       int currentMinutes = dt.hour * 60 + dt.min;
-      if(currentMinutes >= 660 && currentMinutes <= 930)
-         currentWindow = "Window 1 (Early London)";
-      else if(currentMinutes >= 1050 && currentMinutes <= 1170)
-         currentWindow = "Window 2 (Overlap)";
+      if(dt.day_of_week == 6)  // Saturday
+         currentWindow = "Saturday Window (Pre-close)";
+      else if(dt.day_of_week == 1)  // Monday
+      {
+         if(currentMinutes >= (MondayStartHour * 60) && currentMinutes <= 930)
+            currentWindow = "Window 1 (Monday Extended)";
+         else if(currentMinutes >= 1050 && currentMinutes <= 1170)
+            currentWindow = "Window 2 (Overlap)";
+      }
+      else  // Tuesday-Friday
+      {
+         if(currentMinutes >= 660 && currentMinutes <= 930)
+            currentWindow = "Window 1 (Early London)";
+         else if(currentMinutes >= 1050 && currentMinutes <= 1170)
+            currentWindow = "Window 2 (Overlap)";
+      }
    }
 
    // Day name
@@ -895,10 +1365,25 @@ void Dashboard()
       default: dayName = "Unknown"; break;
    }
 
+   string closeMode;
+   if(hedgeTriggeredThisCycle)
+      closeMode = "FIXED TARGET";
+   else
+      closeMode = "TRAILING STOP";
+
    // Build strings beforehand to avoid Comment() parameter count issues
    string windowInfo = "";
    if(TradingMode == MODE_DUAL_WINDOW)
-      windowInfo = "\nWindow 1: 11:00-15:30 UTC+3 (Early London)\nWindow 2: 17:30-19:30 UTC+3 (Overlap)\nGAP SKIPPED: 15:30-17:30 UTC+3";
+   {
+      if(dt.day_of_week == 1)  // Monday
+         windowInfo = "\nMONDAY: Window 1: 05:00-15:30 UTC+3 (Extended)\nWindow 2: 17:30-19:30 UTC+3\nGAP SKIPPED: 15:30-17:30 UTC+3";
+      else if(dt.day_of_week == 6)  // Saturday
+         windowInfo = "\nSATURDAY: Window: 00:00-01:00 UTC+3 (Market closes)";
+      else if(dt.day_of_week == 0)  // Sunday
+         windowInfo = "\nSUNDAY: NO TRADING (Market closed)";
+      else  // Tuesday-Friday
+         windowInfo = "\nTUE-FRI: Window 1: 11:00-15:30 UTC+3\nWindow 2: 17:30-19:30 UTC+3\nGAP SKIPPED: 15:30-17:30 UTC+3";
+   }
 
    string currentWindowInfo = "";
    if(TradingMode == MODE_DUAL_WINDOW && currentWindow != "")
@@ -925,7 +1410,7 @@ void Dashboard()
    if(!dayAllowed) blockReasons += "\n  >> DAY RESTRICTED";
 
    // Build complete dashboard incrementally to avoid expression limits
-   string dashboard = "GRID V6 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)\n";
+   string dashboard = "GRID + HEDGE V6 (Incr + Hedge + Pool + Trail + DUAL WINDOW + DAY FILTER)\n";
 
    dashboard += "\n--- TIME FILTER ---";
    dashboard += "\nTime Filter: " + (EnableTimeFilter ? "ENABLED" : "DISABLED");
@@ -951,24 +1436,29 @@ void Dashboard()
    dashboard += "\nNext Grid Distance: " + IntegerToString(nextDistance) + " pts";
    dashboard += "\nIncrement Step: " + IntegerToString(GridIncrementStep);
 
-   dashboard += "\n\n--- PROFIT/LOSS ---";
-   dashboard += "\nGrid Floating P/L: " + DoubleToString(gridProfit,2);
+   dashboard += "\n\n--- FLOATING P/L ---";
+   dashboard += "\nFloating P/L: " + DoubleToString(totalFloating,2);
 
-   dashboard += "\n\n--- TRAILING STOP ---";
+   dashboard += "\n\n--- HEDGE P/L TRACKING ---";
+   dashboard += "\nRealized Hedge Profit: +" + DoubleToString(realizedHedgeProfit,2);
+   dashboard += "\nRealized Hedge Loss: -" + DoubleToString(realizedHedgeLoss,2);
+   dashboard += "\nNet Realized Hedge: " + DoubleToString(netRealizedHedge,2);
+
+   dashboard += "\n\n--- CLOSE MODE ---";
+   dashboard += "\nMode: " + closeMode;
    dashboard += "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2);
-   dashboard += "\nTrail Start: " + DoubleToString(GridTrailStart,2);
-   dashboard += "\nTrail Step: " + DoubleToString(GridTrailStep,2);
    dashboard += "\nTrail Level: " + ((gridPeakProfit >= GridTrailStart) ? DoubleToString(gridPeakProfit - GridTrailStep,2) : "Not Active");
 
-   dashboard += "\n\n--- TARGETS ---";
-   dashboard += "\nProfit Target: " + DoubleToString(BasketProfit,2);
-   dashboard += "\nStop Loss: " + DoubleToString(BasketStopLoss,2);
+   dashboard += "\n\n--- TRUE RECOVERY ---";
+   dashboard += "\nTrue Recovery Value: " + DoubleToString(trueRecovery,2);
+   dashboard += "\nFixed Target: " + DoubleToString(BasketProfit,2);
 
-   dashboard += "\n\n--- DIRECTION ---";
-   dashboard += "\nGrid Direction: " + ((currentDirection == 0) ? "BUY" : "SELL");
-   dashboard += "\nLoss Pause: " + ((PauseTradingUntil > 0 && TimeCurrent() < PauseTradingUntil) ? "YES (After Stop Loss)" : "NO");
+   dashboard += "\n\n--- STATUS ---";
+   dashboard += "\nHedge Open: " + (IsHedgeOpen() ? "YES" : "NO");
+   dashboard += "\nHedge Triggered: " + (hedgeTriggeredThisCycle ? "YES" : "NO");
+   dashboard += "\nLoss Limit Waiting: " + (lossLimitHitWaitingForHedge ? "YES" : "NO");
 
-   dashboard += "\n\nNOTE: All times in UTC+3 timezone";
+   dashboard += "\n\nNOTE: DST automatically handled by MT5 broker time";
 
    Comment(dashboard);
 }
@@ -1021,6 +1511,44 @@ void OnTick()
       return;
    }
 
+   if(lossLimitHitWaitingForHedge)
+   {
+      double trueRecovery = GetTrueRecoveryValue();
+
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+
+      if(IsHedgeOpen())
+      {
+         ManageSmartHedge();
+
+         Dashboard();
+
+         return;
+      }
+
+      if(currentDirection == 0)
+         currentDirection = 1;
+      else
+         currentDirection = 0;
+
+      PauseTradingUntil =
+      TimeCurrent()
+      + (RestartAfterHours * 3600);
+
+      ResetEngine();
+
+      Dashboard();
+
+      return;
+   }
+
    if(!AllowTrading())
    {
       Dashboard();
@@ -1028,10 +1556,39 @@ void OnTick()
       return;
    }
 
-   // NO POSITIONS
+   if(TotalOurPositions() == 1
+      && IsHedgeOpen())
+   {
+      double trueRecovery = GetTrueRecoveryValue();
+
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+
+      ManageSmartHedge();
+
+      Dashboard();
+
+      return;
+   }
 
    if(TotalOurPositions() == 0)
    {
+      if(hedgeTriggeredThisCycle)
+      {
+         if(currentDirection == 0)
+            currentDirection = 1;
+         else
+            currentDirection = 0;
+
+         ResetEngine();
+      }
+
       OpenFirstTrade();
 
       Dashboard();
@@ -1039,44 +1596,62 @@ void OnTick()
       return;
    }
 
-   // CHECK PROFIT CLOSE CONDITIONS
+   ManageSmartHedge();
 
-   double gridProfit = GetGridProfit();
+   double trueRecovery = GetTrueRecoveryValue();
 
-   // 1. Check trailing stop
-   if(CheckGridTrailingStop())
+   if(hedgeTriggeredThisCycle)
    {
-      RequestCloseAll(false);
+      if(trueRecovery >= BasketProfit)
+      {
+         RequestCloseAll(false);
 
+         Dashboard();
+
+         return;
+      }
+   }
+   else
+   {
+      // NO HEDGE: Use ONLY grid trailing stop (not profit target)
+      // Profit target only applies when hedge is triggered
+      if(CheckGridTrailingStop())
+      {
+         RequestCloseAll(false);
+
+         Dashboard();
+
+         return;
+      }
+   }
+
+   if(IsHedgeOpen())
+   {
       Dashboard();
 
       return;
    }
-
-   // 2. Check fixed profit target
-   if(gridProfit >= BasketProfit)
-   {
-      RequestCloseAll(false);
-
-      Dashboard();
-
-      return;
-   }
-
-   // CHECK STOP LOSS (V4b: $150 loss closes all)
-
-   if(gridProfit <= BasketStopLoss)
-   {
-      RequestCloseAll(true);  // Close with loss mode (will pause)
-
-      Dashboard();
-
-      return;
-   }
-
-   // MANAGE GRID
 
    ManageGrid();
+
+   double gridFloating =
+   GetGridProfit();
+
+   if(gridFloating <= BasketLossLimit)
+   {
+      CloseOnlyGridPositions();
+
+      if(IsHedgeOpen())
+      {
+         lossLimitHitWaitingForHedge = true;
+      }
+      else
+      {
+         PauseTradingUntil =
+         TimeCurrent()
+         + (RestartAfterHours * 3600);
+      }
+   }
 
    Dashboard();
 }
