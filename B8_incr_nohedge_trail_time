@@ -943,11 +943,16 @@ void Dashboard()
    dashboard += "\n\n--- PROFIT/LOSS ---";
    dashboard += "\nGrid Floating P/L: " + DoubleToString(gridProfit,2);
 
-   dashboard += "\n\n--- TRAILING STOP ---";
+   dashboard += "\n\n--- CLOSE MODE ---";
+   bool trailingActive = (gridPeakProfit >= GridTrailStart);
+   dashboard += "\nMode: " + (trailingActive ? "TRAILING STOP (letting profits run)" : "FIXED TARGET ($" + DoubleToString(BasketProfit,2) + ")");
    dashboard += "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2);
-   dashboard += "\nTrail Start: " + DoubleToString(GridTrailStart,2);
-   dashboard += "\nTrail Step: " + DoubleToString(GridTrailStep,2);
-   dashboard += "\nTrail Level: " + ((gridPeakProfit >= GridTrailStart) ? DoubleToString(gridPeakProfit - GridTrailStep,2) : "Not Active");
+   dashboard += "\nTrail Activates At: $" + DoubleToString(GridTrailStart,2);
+   dashboard += "\nTrail Step: $" + DoubleToString(GridTrailStep,2);
+   if(trailingActive)
+      dashboard += "\nTrail Level: $" + DoubleToString(gridPeakProfit - GridTrailStep,2) + " (closes if profit drops here)";
+   else
+      dashboard += "\nTrail Level: Not Active (profit < $" + DoubleToString(GridTrailStart,2) + ")";
 
    dashboard += "\n\n--- TARGETS ---";
    dashboard += "\nProfit Target: " + DoubleToString(BasketProfit,2);
@@ -1032,24 +1037,41 @@ void OnTick()
 
    double gridProfit = GetGridProfit();
 
-   // 1. Check trailing stop
-   if(CheckGridTrailingStop())
+   // Update peak profit tracking
+   if(gridProfit > gridPeakProfit)
+      gridPeakProfit = gridProfit;
+
+   // Determine if trailing stop mode is active
+   bool trailingActive = (gridPeakProfit >= GridTrailStart);
+
+   if(trailingActive)
    {
-      RequestCloseAll(false);
+      // TRAILING MODE: Only close when profit drops GridTrailStep from peak
+      double trailLevel = gridPeakProfit - GridTrailStep;
 
-      Dashboard();
+      if(gridProfit <= trailLevel)
+      {
+         Print("TRAILING STOP triggered: Peak=", gridPeakProfit, " Current=", gridProfit, " TrailLevel=", trailLevel);
+         RequestCloseAll(false);
 
-      return;
+         Dashboard();
+
+         return;
+      }
+      // In trailing mode, ignore fixed profit target - let profits run!
    }
-
-   // 2. Check fixed profit target
-   if(gridProfit >= BasketProfit)
+   else
    {
-      RequestCloseAll(false);
+      // NOT IN TRAILING MODE: Use fixed profit target
+      if(gridProfit >= BasketProfit)
+      {
+         Print("FIXED TARGET reached: Profit=", gridProfit, " Target=", BasketProfit);
+         RequestCloseAll(false);
 
-      Dashboard();
+         Dashboard();
 
-      return;
+         return;
+      }
    }
 
    // CHECK STOP LOSS (V4b: $150 loss closes all)
