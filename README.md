@@ -46,15 +46,19 @@ Each file follows the pattern: `{Series}{Number}_{grid-type}_{hedge}_{pooling}_{
 | **B8_incr_nohedge_trail_time** | **Incremental** | **No** | **N/A** | **Yes** | **N/A** | **N/A** |
 | **B9_incr_hedge_pool_trail_time** | **Incremental** | **Yes** | **Yes** | **Yes** | **Yes** | **No** |
 
-**NEW (V7):** B8 and B9 include **day-aware dual trading windows** with comprehensive filters:
+**NEW (V7):** B8 and B9 include **consistent dual trading windows** with comprehensive filters:
 
-**Trading Modes (MODE_DUAL_WINDOW - Default):**
+**Trading Schedule (MODE_DUAL_WINDOW - Default):**
 | Day | Window 1 | Gap (Skipped) | Window 2 | Total Hours |
 |-----|----------|---------------|----------|-------------|
 | **Sunday** | - | - | - | 0 hrs (Market closed) |
-| **Monday** | 05:00-15:30 (Extended) | 15:30-17:30 | 17:30-19:30 | **12.5 hrs** |
-| **Tue-Fri** | 11:00-15:30 | 15:30-17:30 | 17:30-19:30 | **6.5 hrs** |
-| **Saturday** | 00:00-01:00 | - | - | **1 hr** (Before market close) |
+| **Monday** | 11:00-15:30 | 15:30-17:30 | 17:30-19:30 | **6.5 hrs** |
+| **Tuesday** | 11:00-15:30 | 15:30-17:30 | 17:30-19:30 | **6.5 hrs** |
+| **Wednesday** | 11:00-15:30 | 15:30-17:30 | 17:30-19:30 | **6.5 hrs** |
+| **Thursday** | 11:00-15:30 | 15:30-17:30 | 17:30-19:30 | **6.5 hrs** |
+| **Friday** | 11:00-15:30 | 15:30-17:30 | 17:30-19:30 | **6.5 hrs** |
+| **Saturday** | - | - | - | 0 hrs (Market closes at 01:00) |
+| **Weekly Total** | | | | **~32.5 hrs** |
 
 **Other Trading Modes:**
 - **MODE_OVERLAP_ONLY**: 17:30-19:30 UTC+3 (highest volatility period only)
@@ -63,8 +67,8 @@ Each file follows the pattern: `{Series}{Number}_{grid-type}_{hedge}_{pooling}_{
 - **MODE_CUSTOM**: User-defined hours
 
 **V7 Features:**
-- **Day-Aware Trading Windows**: Monday has extended Window 1 (05:00 start), Saturday has pre-close window
-- **Market Hours Aligned**: Saturday window ends at 01:00 UTC+3 when market closes
+- **Consistent Schedule**: Same trading hours Monday through Friday (no special day handling)
+- **Market Hours Aligned**: Saturday/Sunday blocked (market closes Saturday 01:00 UTC+3)
 - All features work year-round with automatic DST handling
 
 ---
@@ -246,24 +250,20 @@ B8 and B9 now support **5 different trading modes** via dropdown selection:
 **1. MODE_DUAL_WINDOW (Default) ⭐ V7 UPDATE**
 ```cpp
 TradingMode = MODE_DUAL_WINDOW
-// DAY-AWARE WINDOWS (V7):
-// MONDAY:    Window 1: 05:00-15:30 (Extended after gap settlement)
-//            Window 2: 17:30-19:30
-//            Total: 12.5 hours
-// TUE-FRI:   Window 1: 11:00-15:30 (Early London)
+// CONSISTENT WINDOWS (V7) - Same hours Mon-Fri:
+// MON-FRI:   Window 1: 11:00-15:30 (Early London)
 //            Window 2: 17:30-19:30 (London-NY Overlap)
 //            Total: 6.5 hours each day
-// SATURDAY:  Window: 00:00-01:00 (Before market close)
-//            Total: 1 hour
+// SATURDAY:  NO TRADING (Market closes at 01:00 UTC+3)
 // SUNDAY:    NO TRADING (Market closed)
 // GAP SKIPPED: 15:30-17:30 (All days)
 ```
 - **When to use**: Best for data-driven optimal performance (DEFAULT for both B8 and B9)
 - **Benefits**:
-  - **Monday Extended**: Starts at 05:00 after 4-hour gap settlement (vs skipping entire Monday)
-  - **Saturday Trading**: Captures final hour before market close (00:00-01:00)
+  - **Consistent Schedule**: Same trading hours every weekday
+  - **Quality Sessions**: Focuses on London and London-NY overlap (best liquidity)
   - Skips the 15:30-17:30 gap period (lower quality trades)
-  - ~39.5 hours of targeted trading per week
+  - ~32.5 hours of targeted trading per week (6.5 hrs × 5 days)
   - Works year-round with automatic DST handling
 - **Recommendation**: **DEFAULT - Best balance of trading time and quality**
 
@@ -325,10 +325,10 @@ CustomEndMinute = 30
 
 | Strategy | Market Type | Recommended Mode | Trading Window (UTC+3) | Weekly Hours |
 |----------|-------------|------------------|------------------------|--------------|
-| **B8/B9** (General) | All Markets | MODE_DUAL_WINDOW ⭐ | Mon: 05:00-15:30+17:30-19:30, Tue-Fri: 11:00-15:30+17:30-19:30, Sat: 00:00-01:00 | ~39.5 hours |
-| **B8** (Conservative) | Trending | MODE_OVERLAP_ONLY | 17:30-19:30 (daily) | ~10 hours |
-| **B9** (Maximum) | Ranging | MODE_FULL_LONDON | 11:00-19:30 (daily) | ~42.5 hours |
-| Any (Ultra-safe) | High Volatility | MODE_PEAK_HOUR | 17:30-18:30 (daily) | ~5 hours |
+| **B8/B9** (General) | All Markets | MODE_DUAL_WINDOW ⭐ | Mon-Fri: 11:00-15:30 + 17:30-19:30 | ~32.5 hours |
+| **B8** (Conservative) | Trending | MODE_OVERLAP_ONLY | Mon-Fri: 17:30-19:30 | ~10 hours |
+| **B9** (Maximum) | Ranging | MODE_FULL_LONDON | Mon-Fri: 11:00-19:30 | ~42.5 hours |
+| Any (Ultra-safe) | High Volatility | MODE_PEAK_HOUR | Mon-Fri: 17:30-18:30 | ~5 hours |
 | Any (Advanced) | Custom Analysis | MODE_CUSTOM | User-defined | Variable |
 
 #### Automatic DST Handling
@@ -360,38 +360,28 @@ NO MANUAL ADJUSTMENT NEEDED - ALL MODES WORK YEAR-ROUND!
 
 #### Day-of-Week Filter (V7 Feature) 📅
 
-B8 and B9 include smart day-aware trading windows based on market behavior analysis:
+B8 and B9 use a simplified, consistent day filter:
 
-**Monday Trading (V7 Extended Window):**
+**V7 Consistent Schedule:**
 ```cpp
-MondayStartHour = 5            // Monday Window 1 starts at 05:00 UTC+3
-// Monday Schedule:
-// - 00:00-05:00: No trading (gap settlement period)
-// - 05:00-15:30: Window 1 (Extended - 10.5 hours)
-// - 15:30-17:30: Gap skipped
-// - 17:30-19:30: Window 2 (2 hours)
-// Total Monday: 12.5 hours of trading
+// All weekdays use the same trading windows:
+// Monday-Friday: Window 1: 11:00-15:30, Window 2: 17:30-19:30
+// Saturday: NO TRADING (market closes at 01:00 UTC+3, before our windows)
+// Sunday: NO TRADING (market closed)
 ```
-- **Why**: Allow trading after 4-hour gap settlement instead of skipping entire Monday
-- **Effect**: EA starts trading at 05:00 UTC+3 with extended Window 1
-- **Benefit**: Captures Monday trading opportunities while avoiding weekend gap
 
-**Saturday Trading (V7 Pre-Close Window):**
-```cpp
-FridayEndHour = 1              // Saturday trading until 01:00 UTC+3 (market close)
-// Saturday Schedule:
-// - 00:00-01:00: Trading allowed (1 hour before market close)
-// - 01:00+: No trading (market closed)
-```
-- **Why**: Market closes at 01:00 UTC+3 on Saturday
-- **Effect**: EA trades the final hour before weekly market close
-- **Benefit**: Captures any remaining opportunities before weekend
+**Why No Special Monday/Saturday Windows:**
+- **Consistency**: Same strategy behavior every weekday
+- **Quality Focus**: Asian session (05:00-11:00) has lower quality trades
+- **Market Alignment**: Saturday market closes at 01:00 UTC+3, before our 11:00 window starts
 
-**Sunday:**
-- No trading (market closed)
+**XAUUSD Market Hours (UTC+3):**
+- Opens: Monday 01:00 UTC+3
+- Closes: Saturday 01:00 UTC+3
+- Our windows: 11:00-15:30 and 17:30-19:30 (within market hours Mon-Fri)
 
 **Best Trading Days:**
-- **Tuesday-Thursday**: Full trading with standard windows (most consistent price action)
+- **Tuesday-Thursday**: Most consistent price action
 - These are highlighted as "BEST DAY" in the dashboard
 
 **How to Disable:**
@@ -409,7 +399,7 @@ EnableDayFilter = false        // Disable all day restrictions (not recommended)
 
 #### Dashboard Display (V7 Update)
 
-The dashboard shows comprehensive real-time information about all filters with day-specific windows:
+The dashboard shows comprehensive real-time information about all filters:
 
 ```
 GRID V7 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)
@@ -417,16 +407,16 @@ GRID V7 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)
 --- TIME FILTER ---
 Time Filter: ENABLED
 Trading Mode: Dual Window
-MONDAY: Window 1: 05:00-15:30 UTC+3 (Extended)
+MON-FRI: Window 1: 11:00-15:30 UTC+3
 Window 2: 17:30-19:30 UTC+3
 GAP SKIPPED: 15:30-17:30 UTC+3
 Current Time (MT5): 14:15:30 (UTC+3)
-Current Window: Window 1 (Monday Extended)
+Current Window: Window 1 (Early London)
 Time Status: INSIDE WINDOW
 
 --- DAY FILTER ---
 Day Filter: ENABLED
-Today: Monday
+Today: Wednesday (BEST DAY)
 Day Status: ALLOWED
 
 --- TRADING STATUS ---
@@ -435,8 +425,8 @@ Overall Status: TRADING ALLOWED
 
 **V7 Dashboard Shows:**
 - **Trading Mode**: Which MODE is selected (Dual Window, Overlap Only, etc.)
-- **Day-Specific Windows**: Shows the windows for the current day (Monday extended, Tue-Fri standard, Saturday pre-close)
-- **Current Window**: Which window you're currently in (Window 1, Window 2, Monday Extended, Saturday Pre-close)
+- **Consistent Windows**: Same windows displayed for all weekdays (Mon-Fri)
+- **Current Window**: Which window you're currently in (Window 1 or Window 2)
 - **Time Status**: Whether current time is inside or outside trading windows
 - **Day Filter Status**: Current day and whether trading is allowed
 - **Overall Status**: Clear indication if trading is allowed or blocked (and why)
@@ -445,24 +435,24 @@ Overall Status: TRADING ALLOWED
 
 | Feature | B2/B6 (No Filter) | B8/B9 (V7 With Filters) |
 |---------|-------------------|-------------------------|
-| Trading hours | 24/7 | ~39.5 hours/week (MODE_DUAL_WINDOW) |
-| Trading modes | None | 5 modes (V7: Day-aware Dual Window, Overlap, Full London, Peak, Custom) |
-| Day-aware windows | ❌ No | ✅ Yes (V7: Monday extended, Saturday pre-close) |
-| Monday trading | ✅ Full day | ✅ 05:00-15:30 + 17:30-19:30 (12.5 hrs) |
-| Saturday trading | ✅ Until market close | ✅ 00:00-01:00 (1 hr before close) |
+| Trading hours | 24/7 | ~32.5 hours/week (MODE_DUAL_WINDOW) |
+| Trading modes | None | 5 modes (Dual Window, Overlap, Full London, Peak, Custom) |
+| Schedule | N/A | Consistent Mon-Fri (same windows each day) |
+| Monday trading | ✅ Full day | ✅ 11:00-15:30 + 17:30-19:30 (6.5 hrs) |
+| Saturday trading | ✅ Until market close | ❌ No trading (market closes before windows) |
 | Asian session | ✅ Trades (choppy) | ❌ Skips (prevents losses) |
 | Gap period (15:30-17:30) | ✅ Trades | ❌ Skips (MODE_DUAL_WINDOW) |
 | London-NY overlap | ✅ Trades | ✅ Trades (all modes) |
 | DST adjustment | Manual | Automatic (year-round) |
-| Win rate | Lower (all sessions) | Higher (V7: targeted sessions + day-aware) |
+| Win rate | Lower (all sessions) | Higher (V7: targeted sessions) |
 | Drawdown frequency | Higher | Lower (V7: better entry timing) |
-| Weekly coverage | 120+ hours | ~39.5 hours (optimized) |
+| Weekly coverage | 120+ hours | ~32.5 hours (optimized) |
 | Best for | 24/7 monitoring | Strategic time-based trading with full control |
 
 **Recommendation:** Use B8/B9 (V7) for **optimal data-driven performance** with maximum control.
 
 **V7 Mode Recommendations:**
-- **B8/B9 (Default)**: Use MODE_DUAL_WINDOW for best balance (~39.5 hours/week, day-aware)
+- **B8/B9 (Default)**: Use MODE_DUAL_WINDOW for best balance (~32.5 hours/week)
 - **B8 (Conservative)**: Use MODE_OVERLAP_ONLY for highest win rate (~10 hours/week)
 - **B9 (Maximum)**: Use MODE_FULL_LONDON for full session coverage (~42.5 hours/week)
 
@@ -1229,25 +1219,22 @@ During March and November, there are brief periods when one market has switched 
 - **v6**: Enhanced B8 and B9 with comprehensive filters and controls
   - Added dual trading window mode
   - Added day-of-week filter
-- **v7 (Current)**: Day-aware trading windows for B8 and B9
-  - **B8**: Incremental + No Hedge + Trail + Day-Aware Time Filter
-  - **B9**: Incremental + Hedge + Pool + Trail + Day-Aware Time Filter
-  - **NEW: Day-Aware Dual Window (MODE_DUAL_WINDOW)**:
-    - **Monday**: Window 1 extended to 05:00-15:30 (after 4hr gap settlement)
-    - **Tuesday-Friday**: Standard Window 1: 11:00-15:30, Window 2: 17:30-19:30
-    - **Saturday**: Special window 00:00-01:00 (before market close)
+- **v7 (Current)**: Consistent trading windows for B8 and B9
+  - **B8**: Incremental + No Hedge + Trail + Consistent Time Filter
+  - **B9**: Incremental + Hedge + Pool + Trail + Consistent Time Filter
+  - **NEW: Consistent Dual Window Schedule (MODE_DUAL_WINDOW)**:
+    - **Monday-Friday**: Same windows - 11:00-15:30 + 17:30-19:30 UTC+3
+    - **Saturday**: No trading (market closes at 01:00 UTC+3, before our windows)
     - **Sunday**: No trading (market closed)
     - GAP SKIPPED: 15:30-17:30 UTC+3 (all days)
-    - Total: ~39.5 hours of optimized trading per week
-  - **FIXED: Monday Trading Gap**:
-    - Previous v6 had MondayStartHour=23, which meant Monday had effectively ZERO trading
-    - Now Monday starts at 05:00 with extended Window 1, providing 12.5 hours of trading
-  - **FIXED: Saturday Market Close Alignment**:
-    - Previous v6 had FridayEndHour=5 (market already closed at 01:00)
-    - Now correctly stops at 01:00 UTC+3 when XAUUSD market closes
+    - Total: ~32.5 hours of optimized trading per week (6.5 hrs × 5 days)
+  - **Design Decisions**:
+    - **No extended Monday window**: Asian session (05:00-11:00) has lower quality trades
+    - **No Saturday trading**: Market closes at 01:00 UTC+3, before our 11:00 window starts
+    - **Consistency**: Same strategy behavior every weekday for predictable results
   - **Enhanced Dashboard** showing:
-    - Day-specific window information (Monday extended, Saturday pre-close, etc.)
-    - Current window indicator updated for each day type
+    - Consistent window information for all weekdays
+    - Current window indicator (Window 1 or Window 2)
     - Overall trading status with clear day/time context
   - All features work year-round with automatic DST handling
   - 16 total strategy variations available
