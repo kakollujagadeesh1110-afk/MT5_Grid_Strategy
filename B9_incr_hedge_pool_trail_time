@@ -1323,10 +1323,13 @@ void Dashboard()
    }
 
    string closeMode;
+   bool trailingActive = (gridPeakProfit >= GridTrailStart);
    if(hedgeTriggeredThisCycle)
-      closeMode = "FIXED TARGET";
+      closeMode = "HEDGE MODE - FIXED TARGET ($" + DoubleToString(BasketProfit,2) + ")";
+   else if(trailingActive)
+      closeMode = "TRAILING STOP (letting profits run)";
    else
-      closeMode = "TRAILING STOP";
+      closeMode = "FIXED TARGET ($" + DoubleToString(BasketProfit,2) + ")";
 
    // Build strings beforehand to avoid Comment() parameter count issues
    string windowInfo = "";
@@ -1391,8 +1394,15 @@ void Dashboard()
 
    dashboard += "\n\n--- CLOSE MODE ---";
    dashboard += "\nMode: " + closeMode;
-   dashboard += "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2);
-   dashboard += "\nTrail Level: " + ((gridPeakProfit >= GridTrailStart) ? DoubleToString(gridPeakProfit - GridTrailStep,2) : "Not Active");
+   dashboard += "\nGrid Peak Profit: $" + DoubleToString(gridPeakProfit,2);
+   dashboard += "\nTrail Activates At: $" + DoubleToString(GridTrailStart,2);
+   dashboard += "\nTrail Step: $" + DoubleToString(GridTrailStep,2);
+   if(trailingActive && !hedgeTriggeredThisCycle)
+      dashboard += "\nTrail Level: $" + DoubleToString(gridPeakProfit - GridTrailStep,2) + " (closes if profit drops here)";
+   else if(hedgeTriggeredThisCycle)
+      dashboard += "\nTrail Level: N/A (Hedge mode uses fixed target)";
+   else
+      dashboard += "\nTrail Level: Not Active (profit < $" + DoubleToString(GridTrailStart,2) + ")";
 
    dashboard += "\n\n--- TRUE RECOVERY ---";
    dashboard += "\nTrue Recovery Value: " + DoubleToString(trueRecovery,2);
@@ -1547,8 +1557,10 @@ void OnTick()
 
    if(hedgeTriggeredThisCycle)
    {
+      // HEDGE MODE: Use fixed profit target based on true recovery
       if(trueRecovery >= BasketProfit)
       {
+         Print("HEDGE MODE - FIXED TARGET reached: TrueRecovery=", trueRecovery, " Target=", BasketProfit);
          RequestCloseAll(false);
 
          Dashboard();
@@ -1558,15 +1570,44 @@ void OnTick()
    }
    else
    {
-      // NO HEDGE: Use ONLY grid trailing stop (not profit target)
-      // Profit target only applies when hedge is triggered
-      if(CheckGridTrailingStop())
+      // NO HEDGE MODE: Use trailing stop with fixed target fallback
+      double gridProfit = GetGridProfit();
+
+      // Update peak profit tracking
+      if(gridProfit > gridPeakProfit)
+         gridPeakProfit = gridProfit;
+
+      // Determine if trailing stop mode is active
+      bool trailingActive = (gridPeakProfit >= GridTrailStart);
+
+      if(trailingActive)
       {
-         RequestCloseAll(false);
+         // TRAILING MODE: Only close when profit drops GridTrailStep from peak
+         double trailLevel = gridPeakProfit - GridTrailStep;
 
-         Dashboard();
+         if(gridProfit <= trailLevel)
+         {
+            Print("TRAILING STOP triggered: Peak=", gridPeakProfit, " Current=", gridProfit, " TrailLevel=", trailLevel);
+            RequestCloseAll(false);
 
-         return;
+            Dashboard();
+
+            return;
+         }
+         // In trailing mode, ignore fixed profit target - let profits run!
+      }
+      else
+      {
+         // NOT IN TRAILING MODE: Use fixed profit target
+         if(gridProfit >= BasketProfit)
+         {
+            Print("FIXED TARGET reached: Profit=", gridProfit, " Target=", BasketProfit);
+            RequestCloseAll(false);
+
+            Dashboard();
+
+            return;
+         }
       }
    }
 
