@@ -1,12 +1,16 @@
 //+------------------------------------------------------------------+
 //|            XAUUSD GRID + SMART HEDGE ENGINE + TIME FILTER        |
-//|         VERSION 6: INCREMENTAL GRID + HEDGE + TIME FILTERED      |
+//|         VERSION 7: INCREMENTAL GRID + HEDGE + TIME FILTERED      |
 //|         - Incremental grid distance (200×N)                      |
 //|         - Hedge at trigger loss                                  |
 //|         - Grid trailing stop (disabled when hedge triggers)      |
 //|         - Profit pooling                                         |
-//|         - DUAL WINDOW: Early London + Overlap (skips gap)        |
-//|         - DAY FILTER: Monday/Friday restrictions                 |
+//|         - DAY-AWARE DUAL WINDOW:                                 |
+//|           * Monday: 05:00-15:30 + 17:30-19:30 (Extended W1)      |
+//|           * Tue-Fri: 11:00-15:30 + 17:30-19:30 (Standard)        |
+//|           * Saturday: 00:00-01:00 (Before market close)          |
+//|           * Sunday: NO TRADING (Market closed)                   |
+//|         - GAP SKIPPED: 15:30-17:30 UTC+3 (All days)              |
 //|         - AUTO DST HANDLING: Works with MT5 broker time          |
 //+------------------------------------------------------------------+
 #property strict
@@ -85,13 +89,13 @@ input bool   ClosePositionsOutsideHours = false; // Close all if outside trading
 
 input bool   EnableDayFilter          = true;   // Enable day-of-week restrictions
 
-// Monday Settings (avoid early trading after weekend gap)
-input bool   SkipMondayEarly          = true;   // Skip Monday before this hour
-input int    MondayStartHour          = 23;     // Monday start at 11:00 PM UTC+3 (after gap settlement)
+// Monday Settings (extended Window 1 start after weekend gap settlement)
+input bool   SkipMondayEarly          = false;  // Not used - Monday handled by extended time window
+input int    MondayStartHour          = 5;      // Monday Window 1 starts at 05:00 UTC+3 (after 4hr gap settlement)
 
-// Friday/Saturday Settings (avoid late trading before weekend)
-input bool   StopFridayLate           = true;   // Stop Saturday morning after this hour
-input int    FridayEndHour            = 5;      // Saturday stop at 05:00 AM UTC+3 (Friday 9 PM US = Sat 5 AM UTC+3)
+// Friday/Saturday Settings (market closes Saturday 01:00 UTC+3)
+input bool   StopFridayLate           = true;   // Stop Saturday after market close
+input int    FridayEndHour            = 1;      // Saturday stop at 01:00 AM UTC+3 (market close)
 
 //---------------- SAFETY --------------//
 
@@ -170,9 +174,11 @@ int OnInit()
 
       if(TradingMode == MODE_DUAL_WINDOW)
       {
-         Print("  Window 1: 11:00 - 15:30 UTC+3 (Early London)");
-         Print("  Window 2: 17:30 - 19:30 UTC+3 (London-NY Overlap)");
-         Print("  GAP SKIPPED: 15:30 - 17:30 UTC+3 (No trading)");
+         Print("  MONDAY:    05:00-15:30 + 17:30-19:30 UTC+3 (Extended W1)");
+         Print("  TUE-FRI:   11:00-15:30 + 17:30-19:30 UTC+3 (Standard)");
+         Print("  SATURDAY:  00:00-01:00 UTC+3 (Before market close)");
+         Print("  SUNDAY:    NO TRADING (Market closed)");
+         Print("  GAP SKIPPED: 15:30 - 17:30 UTC+3 (All days)");
       }
       else
       {
@@ -194,11 +200,11 @@ int OnInit()
    if(EnableDayFilter)
    {
       Print("=== DAY FILTER: ENABLED ===");
-      if(SkipMondayEarly)
-         Print("  Monday: Skip until ", IntegerToString(MondayStartHour, 2, '0'), ":00 UTC+3");
+      Print("  Sunday: NO TRADING (Market closed)");
+      Print("  Monday: Extended Window 1 from ", IntegerToString(MondayStartHour, 2, '0'), ":00 UTC+3");
       if(StopFridayLate)
-         Print("  Saturday: Stop after ", IntegerToString(FridayEndHour, 2, '0'), ":00 UTC+3");
-      Print("  Best Days: Tuesday-Thursday");
+         Print("  Saturday: Market closes at ", IntegerToString(FridayEndHour, 2, '0'), ":00 UTC+3");
+      Print("  Best Days: Tuesday-Thursday (Full sessions)");
    }
    else
    {
@@ -268,9 +274,9 @@ void GetTradingHours(int &startHour, int &startMin, int &endHour, int &endMin)
 }
 
 //+------------------------------------------------------------------+
-//| V6: CHECK IF WITHIN TRADING HOURS                                |
+//| V7: CHECK IF WITHIN TRADING HOURS                                |
 //| MT5 broker time shows UTC+3 with auto DST handling               |
-//| V6: Handles dual window mode (2 separate windows with gap)      |
+//| V7: Day-aware dual window mode with Monday/Saturday handling     |
 //+------------------------------------------------------------------+
 bool IsWithinTradingHours()
 {
@@ -282,9 +288,34 @@ bool IsWithinTradingHours()
 
    int currentMinutes = dt.hour * 60 + dt.min;
 
-   // V6: Special handling for MODE_DUAL_WINDOW
+   // V7: Special handling for MODE_DUAL_WINDOW with day-specific windows
    if(TradingMode == MODE_DUAL_WINDOW)
    {
+      // SATURDAY: Special window before market close (00:00-01:00 UTC+3)
+      if(dt.day_of_week == 6)
+      {
+         int saturdayEnd = FridayEndHour * 60;  // 01:00 = 60 minutes
+         return (currentMinutes < saturdayEnd);
+      }
+
+      // MONDAY: Extended Window 1 (starts at 05:00 instead of 11:00)
+      if(dt.day_of_week == 1)
+      {
+         // Window 1: 05:00 - 15:30 (Monday extended after gap settlement)
+         int window1Start = MondayStartHour * 60 + 0;  // 05:00 = 300 minutes
+         int window1End = 15 * 60 + 30;                // 15:30 = 930 minutes
+
+         // Window 2: 17:30 - 19:30 (same as other days)
+         int window2Start = 17 * 60 + 30;    // 1050 minutes
+         int window2End = 19 * 60 + 30;      // 1170 minutes
+
+         bool inWindow1 = (currentMinutes >= window1Start) && (currentMinutes <= window1End);
+         bool inWindow2 = (currentMinutes >= window2Start) && (currentMinutes <= window2End);
+
+         return inWindow1 || inWindow2;
+      }
+
+      // TUESDAY-FRIDAY: Standard dual window
       // Window 1: 11:00 - 15:30 (Early London)
       int window1Start = 11 * 60 + 0;    // 660 minutes
       int window1End = 15 * 60 + 30;      // 930 minutes
@@ -321,9 +352,9 @@ bool IsWithinTradingHours()
 }
 
 //+------------------------------------------------------------------+
-//| V6: CHECK DAY-OF-WEEK FILTER                                     |
-//| Returns true if trading allowed based on day/time restrictions  |
-//| NOTE: UTC+3 timezone - Friday 21:00 US = Saturday 05:00 UTC+3   |
+//| V7: CHECK DAY-OF-WEEK FILTER                                     |
+//| Returns true if trading allowed based on day restrictions        |
+//| NOTE: Monday/Saturday timing handled by IsWithinTradingHours()   |
 //+------------------------------------------------------------------+
 bool IsTradingDayAllowed()
 {
@@ -335,28 +366,20 @@ bool IsTradingDayAllowed()
 
    // dt.day_of_week: 0=Sunday, 1=Monday, 2=Tuesday, ..., 6=Saturday
 
-   // Monday restrictions (skip before 23:00 UTC+3 = before 15:00 US Monday)
-   if(dt.day_of_week == 1 && SkipMondayEarly)
-   {
-      // It's Monday, check if before allowed start hour
-      if(dt.hour < MondayStartHour)
-         return false;  // Too early on Monday
-   }
+   // Sunday - no trading (market closed)
+   if(dt.day_of_week == 0)
+      return false;
 
-   // Saturday restrictions (stop after 05:00 UTC+3 = after 21:00 US Friday)
-   // Allow Saturday early morning (00:00-04:59 UTC+3 = Friday evening US)
+   // Saturday - check if market is still open (closes at 01:00 UTC+3)
+   // Time window check is in IsWithinTradingHours(), but block entirely after market close
    if(dt.day_of_week == 6 && StopFridayLate)
    {
-      // It's Saturday, check if after stop hour
       if(dt.hour >= FridayEndHour)
-         return false;  // Too late - Friday evening ended in US
+         return false;  // Market closed
    }
 
-   // Sunday - no trading
-   if(dt.day_of_week == 0)
-      return false;  // No trading on Sunday
-
-   return true;  // All checks passed
+   // Monday-Friday: Allow (time windows handled by IsWithinTradingHours)
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -1310,10 +1333,22 @@ void Dashboard()
    if(TradingMode == MODE_DUAL_WINDOW && withinHours)
    {
       int currentMinutes = dt.hour * 60 + dt.min;
-      if(currentMinutes >= 660 && currentMinutes <= 930)
-         currentWindow = "Window 1 (Early London)";
-      else if(currentMinutes >= 1050 && currentMinutes <= 1170)
-         currentWindow = "Window 2 (Overlap)";
+      if(dt.day_of_week == 6)  // Saturday
+         currentWindow = "Saturday Window (Pre-close)";
+      else if(dt.day_of_week == 1)  // Monday
+      {
+         if(currentMinutes >= (MondayStartHour * 60) && currentMinutes <= 930)
+            currentWindow = "Window 1 (Monday Extended)";
+         else if(currentMinutes >= 1050 && currentMinutes <= 1170)
+            currentWindow = "Window 2 (Overlap)";
+      }
+      else  // Tuesday-Friday
+      {
+         if(currentMinutes >= 660 && currentMinutes <= 930)
+            currentWindow = "Window 1 (Early London)";
+         else if(currentMinutes >= 1050 && currentMinutes <= 1170)
+            currentWindow = "Window 2 (Overlap)";
+      }
    }
 
    // Day name
@@ -1339,7 +1374,16 @@ void Dashboard()
    // Build strings beforehand to avoid Comment() parameter count issues
    string windowInfo = "";
    if(TradingMode == MODE_DUAL_WINDOW)
-      windowInfo = "\nWindow 1: 11:00-15:30 UTC+3 (Early London)\nWindow 2: 17:30-19:30 UTC+3 (Overlap)\nGAP SKIPPED: 15:30-17:30 UTC+3";
+   {
+      if(dt.day_of_week == 1)  // Monday
+         windowInfo = "\nMONDAY: Window 1: 05:00-15:30 UTC+3 (Extended)\nWindow 2: 17:30-19:30 UTC+3\nGAP SKIPPED: 15:30-17:30 UTC+3";
+      else if(dt.day_of_week == 6)  // Saturday
+         windowInfo = "\nSATURDAY: Window: 00:00-01:00 UTC+3 (Market closes)";
+      else if(dt.day_of_week == 0)  // Sunday
+         windowInfo = "\nSUNDAY: NO TRADING (Market closed)";
+      else  // Tuesday-Friday
+         windowInfo = "\nTUE-FRI: Window 1: 11:00-15:30 UTC+3\nWindow 2: 17:30-19:30 UTC+3\nGAP SKIPPED: 15:30-17:30 UTC+3";
+   }
 
    string currentWindowInfo = "";
    if(TradingMode == MODE_DUAL_WINDOW && currentWindow != "")
