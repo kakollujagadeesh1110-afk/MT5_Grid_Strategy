@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|            XAUUSD GRID + SMART HEDGE ENGINE + TIME FILTER        |
-//|         VERSION 7: INCREMENTAL GRID + HEDGE + TIME FILTERED      |
+//|            XAUUSD GRID ENGINE (NO HEDGE) + TIME FILTER           |
+//|         VERSION 7: INCREMENTAL GRID - NO HEDGE - TIME FILTERED   |
 //|         - Incremental grid distance (200×N)                      |
-//|         - Hedge at trigger loss                                  |
-//|         - Grid trailing stop (disabled when hedge triggers)      |
-//|         - Profit pooling                                         |
+//|         - NO hedging - pure grid                                 |
+//|         - Grid trailing stop for profit                          |
+//|         - Stop loss at $150 closes all                           |
 //|         - CONSISTENT DUAL WINDOW (Mon-Fri same hours):           |
 //|           * Window 1: 11:00-15:30 UTC+3 (Early London)           |
 //|           * Window 2: 17:30-19:30 UTC+3 (London-NY Overlap)      |
@@ -20,7 +20,7 @@ CTrade trade;
 
 //========================= INPUTS ==================================//
 
-input ulong  MagicNumber              = 26052509;
+input ulong  MagicNumber              = 26052508;
 
 //---------------- GRID ----------------//
 
@@ -31,7 +31,7 @@ input int    MaxTrades                = 50;
 //---------------- BASKET --------------//
 
 input double BasketProfit             = 10.0;
-input double BasketLossLimit          = -320.0;
+input double BasketStopLoss           = -150.0; // V4b: Stop loss - closes all at this loss
 
 input int    RestartAfterHours        = 2;
 
@@ -39,20 +39,6 @@ input int    RestartAfterHours        = 2;
 
 input double GridTrailStart           = 20.0;   // Start trailing after this profit
 input double GridTrailStep            = 10.0;   // Close if profit drops this much from peak
-
-//---------------- HEDGE ---------------//
-
-input bool   EnableHedge              = true;
-
-input double HedgeTriggerUSD          = 150.0;  // Hedge triggers at this loss
-input double HedgeLot                 = 0.05;
-
-input double HedgeFixedLossUSD        = 75.0;
-
-input double HedgeTrailStart          = 20.0;
-input double HedgeTrailStep           = 10.0;
-
-input int    HedgeCloseDeviation      = 500;
 
 //---------------- TIME FILTER (V6) ----------------//
 // MT5 shows UTC+3 time - DST handled automatically by broker
@@ -110,34 +96,14 @@ input int    TradeCooldownSeconds     = 3;
 
 int currentDirection = -1;
 
-double realizedHedgeLoss = 0.0;
-
-double realizedHedgeProfit = 0.0;
-
-double hedgePeakProfit = 0.0;
-
 double gridPeakProfit = 0.0;
 
-ENUM_ORDER_TYPE hedgeSignalType;
-
 datetime PauseTradingUntil = 0;
-
-double lastHedgeOpenPrice = 0.0;
 
 datetime lastTradeTime = 0;
 
 bool closeAllPending = false;
 bool closeAfterLoss  = false;
-
-//--- FLAGS FOR GRID/HEDGE CONTROL ---//
-
-bool hedgeTriggeredThisCycle = false;
-
-bool lastHedgeWasLoss = false;
-
-ENUM_ORDER_TYPE lastHedgeType;
-
-bool lossLimitHitWaitingForHedge = false;
 
 //+------------------------------------------------------------------+
 //| INIT                                                             |
@@ -412,21 +378,6 @@ bool IsGridPosition()
 }
 
 //+------------------------------------------------------------------+
-//| IS HEDGE POSITION                                                |
-//+------------------------------------------------------------------+
-bool IsHedgePosition()
-{
-   if(!IsOurPosition())
-      return false;
-
-   if(PositionGetString(POSITION_COMMENT)
-      == "HEDGE")
-      return true;
-
-   return false;
-}
-
-//+------------------------------------------------------------------+
 //| SPREAD CHECK                                                     |
 //+------------------------------------------------------------------+
 bool SpreadOK()
@@ -558,35 +509,7 @@ int TotalGridPositions()
 }
 
 //+------------------------------------------------------------------+
-//| TOTAL PROFIT (Floating P/L of all open positions)                |
-//+------------------------------------------------------------------+
-double GetTotalProfit()
-{
-   double profit = 0.0;
-
-   for(int i=0;i<PositionsTotal();i++)
-   {
-      ulong ticket =
-      PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(!IsOurPosition())
-         continue;
-
-      profit +=
-      PositionGetDouble(POSITION_PROFIT);
-
-      profit +=
-      PositionGetDouble(POSITION_SWAP);
-   }
-
-   return profit;
-}
-
-//+------------------------------------------------------------------+
-//| GRID PROFIT ONLY                                                 |
+//| GET GRID PROFIT                                                  |
 //+------------------------------------------------------------------+
 double GetGridProfit()
 {
@@ -611,58 +534,6 @@ double GetGridProfit()
    }
 
    return profit;
-}
-
-//+------------------------------------------------------------------+
-//| TRUE RECOVERY VALUE                                              |
-//+------------------------------------------------------------------+
-double GetTrueRecoveryValue()
-{
-   double floatingPL = GetTotalProfit();
-
-   double netRealizedHedge = realizedHedgeProfit - realizedHedgeLoss;
-
-   return floatingPL + netRealizedHedge;
-}
-
-//+------------------------------------------------------------------+
-//| HEDGE OPEN CHECK                                                 |
-//+------------------------------------------------------------------+
-bool IsHedgeOpen()
-{
-   for(int i=0;i<PositionsTotal();i++)
-   {
-      ulong ticket =
-      PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(IsHedgePosition())
-         return true;
-   }
-
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| CLOSE ONLY GRID POSITIONS                                        |
-//+------------------------------------------------------------------+
-void CloseOnlyGridPositions()
-{
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
-      ulong ticket =
-      PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(!IsGridPosition())
-         continue;
-
-      trade.PositionClose(ticket);
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -720,7 +591,6 @@ int GetIncrementalGridDistance()
 {
    int gridCount = TotalGridPositions();
 
-   // If no grid yet, first distance is 1 × Step
    if(gridCount == 0)
       gridCount = 1;
 
@@ -732,287 +602,7 @@ int GetIncrementalGridDistance()
 //+------------------------------------------------------------------+
 void ResetEngine()
 {
-   realizedHedgeLoss = 0.0;
-
-   realizedHedgeProfit = 0.0;
-
-   hedgePeakProfit = 0.0;
-
    gridPeakProfit = 0.0;
-
-   lastHedgeOpenPrice = 0.0;
-
-   hedgeTriggeredThisCycle = false;
-   lastHedgeWasLoss = false;
-   lossLimitHitWaitingForHedge = false;
-}
-
-//+------------------------------------------------------------------+
-//| PREPARE HEDGE                                                    |
-//+------------------------------------------------------------------+
-void PrepareHedge()
-{
-   double buyLots = 0.0;
-   double sellLots = 0.0;
-
-   for(int i=0;i<PositionsTotal();i++)
-   {
-      ulong ticket =
-      PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(!IsGridPosition())
-         continue;
-
-      double lot =
-      PositionGetDouble(POSITION_VOLUME);
-
-      if(PositionGetInteger(POSITION_TYPE)
-         == POSITION_TYPE_BUY)
-      {
-         buyLots += lot;
-      }
-      else
-      {
-         sellLots += lot;
-      }
-   }
-
-   if(buyLots > sellLots)
-      hedgeSignalType = ORDER_TYPE_SELL;
-   else
-      hedgeSignalType = ORDER_TYPE_BUY;
-}
-
-//+------------------------------------------------------------------+
-//| OPEN AUTO HEDGE                                                  |
-//+------------------------------------------------------------------+
-void OpenAutoHedge()
-{
-   if(!EnableHedge)
-      return;
-
-   if(IsHedgeOpen())
-      return;
-
-   if(!MarginOK())
-      return;
-
-   double ask =
-   SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-
-   double bid =
-   SymbolInfoDouble(_Symbol,SYMBOL_BID);
-
-   bool result = false;
-
-   hedgePeakProfit = 0.0;
-
-   double lot =
-   NormalizeLot(HedgeLot);
-
-   trade.SetDeviationInPoints(HedgeCloseDeviation);
-
-   if(hedgeSignalType == ORDER_TYPE_BUY)
-   {
-      result =
-      trade.Buy(
-         lot,
-         _Symbol,
-         ask,
-         0,
-         0,
-         "HEDGE"
-      );
-
-      if(result)
-      {
-         lastHedgeOpenPrice = ask;
-         hedgeTriggeredThisCycle = true;
-         lastHedgeType = ORDER_TYPE_BUY;
-         lastHedgeWasLoss = false;
-      }
-   }
-   else
-   {
-      result =
-      trade.Sell(
-         lot,
-         _Symbol,
-         bid,
-         0,
-         0,
-         "HEDGE"
-      );
-
-      if(result)
-      {
-         lastHedgeOpenPrice = bid;
-         hedgeTriggeredThisCycle = true;
-         lastHedgeType = ORDER_TYPE_SELL;
-         lastHedgeWasLoss = false;
-      }
-   }
-
-   trade.SetDeviationInPoints(20);
-}
-
-//+------------------------------------------------------------------+
-//| CLOSE POSITION + REALIZED PL                                     |
-//+------------------------------------------------------------------+
-bool ClosePositionGetPL(
-   ulong ticket,
-   double &realizedPL
-)
-{
-   realizedPL = 0.0;
-
-   trade.SetDeviationInPoints(HedgeCloseDeviation);
-
-   bool result =
-   trade.PositionClose(ticket);
-
-   trade.SetDeviationInPoints(20);
-
-   if(!result)
-      return false;
-
-   ulong deal =
-   trade.ResultDeal();
-
-   if(deal > 0
-      && HistoryDealSelect(deal))
-   {
-      realizedPL =
-      HistoryDealGetDouble(
-         deal,
-         DEAL_PROFIT
-      );
-
-      realizedPL +=
-      HistoryDealGetDouble(
-         deal,
-         DEAL_SWAP
-      );
-
-      realizedPL +=
-      HistoryDealGetDouble(
-         deal,
-         DEAL_COMMISSION
-      );
-   }
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| MANAGE SMART HEDGE                                               |
-//+------------------------------------------------------------------+
-void ManageSmartHedge()
-{
-   if(!EnableHedge)
-      return;
-
-   double gridLoss =
-   MathMax(0,-GetGridProfit());
-
-   if(!IsHedgeOpen()
-      && gridLoss >= HedgeTriggerUSD)
-   {
-      if(lastHedgeWasLoss && lastHedgeOpenPrice > 0)
-      {
-         double ask =
-         SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-
-         double bid =
-         SymbolInfoDouble(_Symbol,SYMBOL_BID);
-
-         bool priceReturned = false;
-
-         if(lastHedgeType == ORDER_TYPE_SELL)
-         {
-            if(ask >= lastHedgeOpenPrice)
-               priceReturned = true;
-         }
-         else if(lastHedgeType == ORDER_TYPE_BUY)
-         {
-            if(bid <= lastHedgeOpenPrice)
-               priceReturned = true;
-         }
-
-         if(!priceReturned)
-            return;
-      }
-
-      PrepareHedge();
-
-      OpenAutoHedge();
-
-      return;
-   }
-
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
-      ulong ticket =
-      PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(!IsHedgePosition())
-         continue;
-
-      double profit =
-      PositionGetDouble(POSITION_PROFIT);
-
-      if(profit <= -HedgeFixedLossUSD)
-      {
-         double realized = 0.0;
-
-         if(ClosePositionGetPL(ticket,realized))
-         {
-            realizedHedgeLoss +=
-            MathAbs(realized);
-
-            hedgePeakProfit = 0.0;
-
-            lastHedgeWasLoss = true;
-         }
-
-         return;
-      }
-
-      if(profit > hedgePeakProfit)
-         hedgePeakProfit = profit;
-
-      if(hedgePeakProfit >= HedgeTrailStart)
-      {
-         double trailLevel =
-         hedgePeakProfit
-         - HedgeTrailStep;
-
-         if(profit <= trailLevel)
-         {
-            double realized = 0.0;
-
-            if(ClosePositionGetPL(ticket,realized))
-            {
-               hedgePeakProfit = 0.0;
-
-               if(realized > 0)
-                  realizedHedgeProfit += realized;
-               else
-                  realizedHedgeLoss += MathAbs(realized);
-
-               lastHedgeWasLoss = false;
-            }
-
-            return;
-         }
-      }
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -1020,12 +610,6 @@ void ManageSmartHedge()
 //+------------------------------------------------------------------+
 void ManageGrid()
 {
-   if(IsHedgeOpen())
-      return;
-
-   if(hedgeTriggeredThisCycle)
-      return;
-
    if(!SpreadOK())
       return;
 
@@ -1128,12 +712,6 @@ void ManageGrid()
 //+------------------------------------------------------------------+
 void OpenFirstTrade()
 {
-   if(IsHedgeOpen())
-      return;
-
-   if(hedgeTriggeredThisCycle)
-      return;
-
    if(!AllowTrading())
       return;
 
@@ -1239,19 +817,16 @@ void ProcessCloseAll()
 //+------------------------------------------------------------------+
 bool CheckGridTrailingStop()
 {
-   if(hedgeTriggeredThisCycle)
-      return false;
+   double gridProfit = GetGridProfit();
 
-   double trueRecovery = GetTrueRecoveryValue();
-
-   if(trueRecovery > gridPeakProfit)
-      gridPeakProfit = trueRecovery;
+   if(gridProfit > gridPeakProfit)
+      gridPeakProfit = gridProfit;
 
    if(gridPeakProfit >= GridTrailStart)
    {
       double trailLevel = gridPeakProfit - GridTrailStep;
 
-      if(trueRecovery <= trailLevel)
+      if(gridProfit <= trailLevel)
          return true;
    }
 
@@ -1263,14 +838,8 @@ bool CheckGridTrailingStop()
 //+------------------------------------------------------------------+
 void Dashboard()
 {
-   double totalFloating =
-   GetTotalProfit();
-
-   double trueRecovery =
-   GetTrueRecoveryValue();
-
-   double netRealizedHedge =
-   realizedHedgeProfit - realizedHedgeLoss;
+   double gridProfit =
+   GetGridProfit();
 
    int gridCount = TotalGridPositions();
    int nextDistance = GetIncrementalGridDistance();
@@ -1280,10 +849,6 @@ void Dashboard()
    string currentTime = StringFormat("%02d:%02d:%02d", dt.hour, dt.min, dt.sec);
 
    bool withinHours = IsWithinTradingHours();
-
-   int startHour, startMin, endHour, endMin;
-   GetTradingHours(startHour, startMin, endHour, endMin);
-
    bool dayAllowed = IsTradingDayAllowed();
 
    string modeName;
@@ -1322,15 +887,6 @@ void Dashboard()
       default: dayName = "Unknown"; break;
    }
 
-   string closeMode;
-   bool trailingActive = (gridPeakProfit >= GridTrailStart);
-   if(hedgeTriggeredThisCycle)
-      closeMode = "HEDGE MODE - FIXED TARGET ($" + DoubleToString(BasketProfit,2) + ")";
-   else if(trailingActive)
-      closeMode = "TRAILING STOP (letting profits run)";
-   else
-      closeMode = "FIXED TARGET ($" + DoubleToString(BasketProfit,2) + ")";
-
    // Build strings beforehand to avoid Comment() parameter count issues
    string windowInfo = "";
    if(TradingMode == MODE_DUAL_WINDOW)
@@ -1360,7 +916,7 @@ void Dashboard()
    if(!dayAllowed) blockReasons += "\n  >> DAY RESTRICTED";
 
    // Build complete dashboard incrementally to avoid expression limits
-   string dashboard = "GRID + HEDGE V6 (Incr + Hedge + Pool + Trail + DUAL WINDOW + DAY FILTER)\n";
+   string dashboard = "GRID V6 (Incremental + NO HEDGE + DUAL WINDOW + DAY FILTER)\n";
 
    dashboard += "\n--- TIME FILTER ---";
    dashboard += "\nTime Filter: " + (EnableTimeFilter ? "ENABLED" : "DISABLED");
@@ -1384,36 +940,29 @@ void Dashboard()
    dashboard += "\nNext Grid Distance: " + IntegerToString(nextDistance) + " pts";
    dashboard += "\nIncrement Step: " + IntegerToString(GridIncrementStep);
 
-   dashboard += "\n\n--- FLOATING P/L ---";
-   dashboard += "\nFloating P/L: " + DoubleToString(totalFloating,2);
-
-   dashboard += "\n\n--- HEDGE P/L TRACKING ---";
-   dashboard += "\nRealized Hedge Profit: +" + DoubleToString(realizedHedgeProfit,2);
-   dashboard += "\nRealized Hedge Loss: -" + DoubleToString(realizedHedgeLoss,2);
-   dashboard += "\nNet Realized Hedge: " + DoubleToString(netRealizedHedge,2);
+   dashboard += "\n\n--- PROFIT/LOSS ---";
+   dashboard += "\nGrid Floating P/L: " + DoubleToString(gridProfit,2);
 
    dashboard += "\n\n--- CLOSE MODE ---";
-   dashboard += "\nMode: " + closeMode;
-   dashboard += "\nGrid Peak Profit: $" + DoubleToString(gridPeakProfit,2);
+   bool trailingActive = (gridPeakProfit >= GridTrailStart);
+   dashboard += "\nMode: " + (trailingActive ? "TRAILING STOP (letting profits run)" : "FIXED TARGET ($" + DoubleToString(BasketProfit,2) + ")");
+   dashboard += "\nGrid Peak Profit: " + DoubleToString(gridPeakProfit,2);
    dashboard += "\nTrail Activates At: $" + DoubleToString(GridTrailStart,2);
    dashboard += "\nTrail Step: $" + DoubleToString(GridTrailStep,2);
-   if(trailingActive && !hedgeTriggeredThisCycle)
+   if(trailingActive)
       dashboard += "\nTrail Level: $" + DoubleToString(gridPeakProfit - GridTrailStep,2) + " (closes if profit drops here)";
-   else if(hedgeTriggeredThisCycle)
-      dashboard += "\nTrail Level: N/A (Hedge mode uses fixed target)";
    else
       dashboard += "\nTrail Level: Not Active (profit < $" + DoubleToString(GridTrailStart,2) + ")";
 
-   dashboard += "\n\n--- TRUE RECOVERY ---";
-   dashboard += "\nTrue Recovery Value: " + DoubleToString(trueRecovery,2);
-   dashboard += "\nFixed Target: " + DoubleToString(BasketProfit,2);
+   dashboard += "\n\n--- TARGETS ---";
+   dashboard += "\nProfit Target: " + DoubleToString(BasketProfit,2);
+   dashboard += "\nStop Loss: " + DoubleToString(BasketStopLoss,2);
 
-   dashboard += "\n\n--- STATUS ---";
-   dashboard += "\nHedge Open: " + (IsHedgeOpen() ? "YES" : "NO");
-   dashboard += "\nHedge Triggered: " + (hedgeTriggeredThisCycle ? "YES" : "NO");
-   dashboard += "\nLoss Limit Waiting: " + (lossLimitHitWaitingForHedge ? "YES" : "NO");
+   dashboard += "\n\n--- DIRECTION ---";
+   dashboard += "\nGrid Direction: " + ((currentDirection == 0) ? "BUY" : "SELL");
+   dashboard += "\nLoss Pause: " + ((PauseTradingUntil > 0 && TimeCurrent() < PauseTradingUntil) ? "YES (After Stop Loss)" : "NO");
 
-   dashboard += "\n\nNOTE: DST automatically handled by MT5 broker time";
+   dashboard += "\n\nNOTE: All times in UTC+3 timezone";
 
    Comment(dashboard);
 }
@@ -1441,187 +990,96 @@ void OnTick()
    // STEP 3: Determine if we can open NEW positions
    bool canOpenNewPositions = true;
 
+   // Check day filter
    if(!IsTradingDayAllowed())
       canOpenNewPositions = false;
 
+   // Check time filter
    if(!IsWithinTradingHours())
       canOpenNewPositions = false;
 
+   // Check balance limit
    if(!AllowTrading())
       canOpenNewPositions = false;
 
-   // STEP 4: Handle special state - loss limit hit, waiting for hedge to recover
-   if(lossLimitHitWaitingForHedge)
-   {
-      double trueRecovery = GetTrueRecoveryValue();
-
-      // Check if we've recovered enough to close
-      if(trueRecovery >= BasketProfit)
-      {
-         Print("RECOVERY TARGET reached: TrueRecovery=", trueRecovery, " Target=", BasketProfit);
-         RequestCloseAll(false);
-         Dashboard();
-         return;
-      }
-
-      // Manage hedge if open
-      if(IsHedgeOpen())
-      {
-         ManageSmartHedge();
-         Dashboard();
-         return;
-      }
-
-      // Hedge closed but didn't reach target - reset and pause
-      if(currentDirection == 0)
-         currentDirection = 1;
-      else
-         currentDirection = 0;
-
-      PauseTradingUntil = TimeCurrent() + (RestartAfterHours * 3600);
-      ResetEngine();
-      Dashboard();
-      return;
-   }
-
-   // STEP 5: Get position counts
+   // STEP 4: If we have active positions, ALWAYS manage them (regardless of trading hours)
    int totalPositions = TotalOurPositions();
-   bool hedgeOpen = IsHedgeOpen();
 
-   // STEP 6: If we have active positions, ALWAYS manage them (regardless of trading hours)
    if(totalPositions > 0)
    {
-      // Always manage hedge if open
-      if(hedgeOpen)
-      {
-         ManageSmartHedge();
-      }
-
-      // Get current values for close checks
+      // Get current grid profit
       double gridProfit = GetGridProfit();
-      double trueRecovery = GetTrueRecoveryValue();
 
       // Update peak profit tracking for trailing stop
       if(gridProfit > gridPeakProfit)
          gridPeakProfit = gridProfit;
 
-      // CASE A: Hedge was triggered this cycle - use true recovery for profit target
-      if(hedgeTriggeredThisCycle)
+      // CHECK STOP LOSS FIRST (highest priority)
+      if(gridProfit <= BasketStopLoss)
       {
-         if(trueRecovery >= BasketProfit)
+         Print("STOP LOSS triggered: GridProfit=", gridProfit, " StopLoss=", BasketStopLoss);
+         RequestCloseAll(true);  // Close with loss mode (will pause)
+         Dashboard();
+         return;
+      }
+
+      // CHECK PROFIT CLOSE CONDITIONS
+      bool trailingActive = (gridPeakProfit >= GridTrailStart);
+
+      if(trailingActive)
+      {
+         // TRAILING MODE: Close when profit drops GridTrailStep from peak
+         double trailLevel = gridPeakProfit - GridTrailStep;
+
+         if(gridProfit <= trailLevel)
          {
-            Print("HEDGE MODE - FIXED TARGET reached: TrueRecovery=", trueRecovery, " Target=", BasketProfit);
+            Print("TRAILING STOP triggered: Peak=", gridPeakProfit, " Current=", gridProfit, " TrailLevel=", trailLevel);
             RequestCloseAll(false);
             Dashboard();
             return;
          }
-
-         // If only hedge position remains (grid closed)
-         if(totalPositions == 1 && hedgeOpen)
-         {
-            Dashboard();
-            return;  // Just manage hedge, wait for profit target
-         }
+         // In trailing mode, let profits run - don't check fixed target
       }
-      // CASE B: No hedge triggered - use grid trailing stop / fixed target
       else
       {
-         bool trailingActive = (gridPeakProfit >= GridTrailStart);
-
-         if(trailingActive)
+         // NOT IN TRAILING MODE: Use fixed profit target
+         if(gridProfit >= BasketProfit)
          {
-            // TRAILING MODE: Close when profit drops GridTrailStep from peak
-            double trailLevel = gridPeakProfit - GridTrailStep;
-
-            if(gridProfit <= trailLevel)
-            {
-               Print("TRAILING STOP triggered: Peak=", gridPeakProfit, " Current=", gridProfit, " TrailLevel=", trailLevel);
-               RequestCloseAll(false);
-               Dashboard();
-               return;
-            }
-            // In trailing mode, let profits run
-         }
-         else
-         {
-            // NOT IN TRAILING MODE: Use fixed profit target
-            if(gridProfit >= BasketProfit)
-            {
-               Print("FIXED TARGET reached: Profit=", gridProfit, " Target=", BasketProfit);
-               RequestCloseAll(false);
-               Dashboard();
-               return;
-            }
-         }
-      }
-
-      // CHECK GRID LOSS LIMIT (triggers hedge)
-      if(!hedgeOpen && !hedgeTriggeredThisCycle)
-      {
-         if(gridProfit <= BasketLossLimit)
-         {
-            Print("GRID LOSS LIMIT reached: GridProfit=", gridProfit, " Limit=", BasketLossLimit);
-            CloseOnlyGridPositions();
-
-            if(IsHedgeOpen())
-            {
-               lossLimitHitWaitingForHedge = true;
-            }
-            else
-            {
-               // FIX: Switch direction when stop loss hit without hedge
-               if(currentDirection == 0)
-                  currentDirection = 1;
-               else
-                  currentDirection = 0;
-
-               ResetEngine();  // Reset flags for new cycle
-
-               PauseTradingUntil = TimeCurrent() + (RestartAfterHours * 3600);
-            }
+            Print("FIXED TARGET reached: Profit=", gridProfit, " Target=", BasketProfit);
+            RequestCloseAll(false);
             Dashboard();
             return;
          }
       }
 
-      // If outside trading hours but have positions
+      // If outside trading hours but have positions, we managed them above
+      // Now check if we should force close or just wait
       if(!canOpenNewPositions)
       {
+         // Outside trading hours with active grid
          if(ClosePositionsOutsideHours)
          {
             Print("OUTSIDE HOURS - Force closing all positions");
             RequestCloseAll(false);
          }
-         // Else: Keep positions open but don't add new grid levels
+         // Else: Keep grid open, but don't add new positions
          Dashboard();
          return;
       }
 
-      // Inside trading hours with active positions
-      if(!hedgeOpen)
-      {
-         ManageGrid();  // Add grid levels if needed
-      }
-
+      // Inside trading hours with active grid - continue managing
+      ManageGrid();
       Dashboard();
       return;
    }
 
-   // STEP 7: No positions - check if we can open new ones
+   // STEP 5: No positions - check if we can open new ones
    if(totalPositions == 0)
    {
-      // Reset for new cycle
-      if(hedgeTriggeredThisCycle)
+      // Reset peak profit for new cycle
+      if(gridPeakProfit > 0)
       {
-         if(currentDirection == 0)
-            currentDirection = 1;
-         else
-            currentDirection = 0;
-         ResetEngine();
-      }
-      else if(gridPeakProfit > 0)
-      {
-         gridPeakProfit = 0.0;  // Reset peak profit for new cycle
+         gridPeakProfit = 0.0;  // Reset for new cycle
       }
 
       if(canOpenNewPositions)
