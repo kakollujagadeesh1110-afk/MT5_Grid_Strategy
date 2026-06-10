@@ -394,11 +394,10 @@ void OnTick()
 
    double gridProfit = GetGridProfit();
 
-   // CHECK GRID TRAILING STOP
+   // CHECK TRAILING STOP (NO FIXED PROFIT TARGET for no-hedge + trailing strategy)
+   // Exit ONLY via: 1) Trailing stop, or 2) Stop loss
    if(CheckGridTrailingStop()) { RequestCloseAll(false); Dashboard(); return; }
-
-   // CHECK PROFIT TARGET
-   if(gridProfit >= BasketProfit) { RequestCloseAll(false); Dashboard(); return; }
+   // If trailing not yet active, just wait (no fixed profit target)
 
    // CHECK STOP LOSS
    if(gridProfit <= BasketStopLoss) { RequestCloseAll(true); Dashboard(); return; }
