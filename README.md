@@ -186,6 +186,24 @@ Example Trailing Scenario:
 - Without trailing, might have waited for $10 and price reversed to -$50
 ```
 
+**V7 Fix - Trailing vs Fixed Target Logic:**
+- If profit never reaches $20 (GridTrailStart): Uses fixed target ($10)
+- Once peak profit reaches $20+: Trailing mode activates, **fixed target is IGNORED**
+- This allows profits to run beyond $10 when momentum is strong
+
+```
+Example - How Trailing and Fixed Target Interact:
+
+Scenario A: Profit rises slowly
+- Profit: 0 → 5 → 10 → CLOSE at $10 (fixed target, trailing never activated)
+
+Scenario B: Profit spikes then drops
+- Profit: 0 → 5 → 25 (peak) → 20 → 16 → CLOSE at $15
+- Trail level = $25 - $10 = $15
+- Fixed target ($10) is IGNORED once trailing activates
+- Result: $15 profit instead of $10!
+```
+
 **Important:** Grid trailing is DISABLED when hedge triggers. Why?
 - After hedge triggers, you need to recover hedge losses
 - Fixed target ensures you wait for full recovery
@@ -352,11 +370,33 @@ NO MANUAL ADJUSTMENT NEEDED - ALL MODES WORK YEAR-ROUND!
 
 #### Time Filter Behavior
 
+**V7 Behavior - Active Position Management:**
+- **Active positions are ALWAYS managed** regardless of trading hours
+- Stop loss and trailing stop are checked every tick, even outside trading windows
+- Time filter only blocks **opening NEW positions**, not managing existing ones
+- This ensures you never get stuck with an unmanaged grid when trading hours end
+
+```
+Example - Grid Open When Trading Hours End:
+
+Before V7 (BUG):
+- Grid active at 19:30 (end of Window 2)
+- Trading hours end → EA stops checking stop loss/trailing
+- Grid continues losing without any exit management!
+
+After V7 (FIXED):
+- Grid active at 19:30 (end of Window 2)
+- Trading hours end → EA still checks stop loss and trailing stop every tick
+- Grid closes properly when stop loss or trailing stop is triggered
+- Only NEW grid opening is blocked outside hours
+```
+
 **Default Behavior:**
 - Open positions continue running even outside trading hours
-- The EA only checks timezone when opening NEW baskets
+- Stop loss and trailing stop remain active at all times
 - Existing baskets close based on exit conditions (profit target, trail stop, loss limit)
-- Time filter only affects opening new positions, not managing existing ones
+- `ClosePositionsOutsideHours = false` (default): Keep grid open, manage exits
+- `ClosePositionsOutsideHours = true`: Force close all when hours end
 
 #### Day-of-Week Filter (V7 Feature) 📅
 
@@ -1219,9 +1259,20 @@ During March and November, there are brief periods when one market has switched 
 - **v6**: Enhanced B8 and B9 with comprehensive filters and controls
   - Added dual trading window mode
   - Added day-of-week filter
-- **v7 (Current)**: Consistent trading windows for B8 and B9
+- **v7 (Current)**: Bug fixes + Consistent trading windows for B8 and B9
   - **B8**: Incremental + No Hedge + Trail + Consistent Time Filter
   - **B9**: Incremental + Hedge + Pool + Trail + Consistent Time Filter
+  - **CRITICAL BUG FIXES**:
+    - **Trailing Stop Fix**: Fixed target ($10) now only checked when trailing is NOT active
+      - Previously: Fixed target always triggered at $10, preventing trailing from ever activating
+      - Now: Once peak profit reaches $20, trailing takes over and fixed target is ignored
+      - Result: Profits can run beyond $10 when momentum is strong
+    - **Active Position Management Fix**: Stop loss and trailing stop now checked every tick
+      - Previously: When trading hours ended, active grids were not managed (no exit checks)
+      - Now: Active positions are ALWAYS managed regardless of trading hours
+      - Time filter only blocks opening NEW positions, not managing existing ones
+    - **B8 No-Hedge Logic**: Removed basket profit pooling concepts (B8 has no hedge)
+      - Clean grid-only logic with proper cycle reset between trades
   - **NEW: Consistent Dual Window Schedule (MODE_DUAL_WINDOW)**:
     - **Monday-Friday**: Same windows - 11:00-15:30 + 17:30-19:30 UTC+3
     - **Saturday**: No trading (market closes at 01:00 UTC+3, before our windows)
