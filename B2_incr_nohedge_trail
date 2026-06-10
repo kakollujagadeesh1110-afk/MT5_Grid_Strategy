@@ -695,11 +695,12 @@ void OnTick()
       return;
    }
 
-   // CHECK PROFIT CLOSE CONDITIONS
+   // CHECK PROFIT CLOSE CONDITIONS (TRAILING ONLY - no fixed profit target)
+   // Exit ONLY via: 1) Trailing stop, or 2) Stop loss
 
    double gridProfit = GetGridProfit();
 
-   // 1. Check trailing stop
+   // Check trailing stop (waits for GridTrailStart, then trails by GridTrailStep)
    if(CheckGridTrailingStop())
    {
       RequestCloseAll(false);
@@ -708,16 +709,7 @@ void OnTick()
 
       return;
    }
-
-   // 2. Check fixed profit target
-   if(gridProfit >= BasketProfit)
-   {
-      RequestCloseAll(false);
-
-      Dashboard();
-
-      return;
-   }
+   // If trailing not yet active, just wait (no fixed profit target)
 
    // CHECK STOP LOSS (V4b: $150 loss closes all)
 
