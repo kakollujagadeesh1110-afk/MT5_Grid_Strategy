@@ -1311,7 +1311,15 @@ void OnTick()
       }
       else
       {
-         // No hedge - set pause immediately (original behavior)
+         // FIX: Switch direction when stop loss hit without hedge
+         if(currentDirection == 0)
+            currentDirection = 1;
+         else
+            currentDirection = 0;
+
+         ResetEngine();  // Reset flags for new cycle
+
+         // No hedge - set pause immediately
          PauseTradingUntil =
          TimeCurrent()
          + (RestartAfterHours * 3600);
