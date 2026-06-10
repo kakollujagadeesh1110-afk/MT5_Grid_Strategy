@@ -186,28 +186,32 @@ Example Trailing Scenario:
 - Without trailing, might have waited for $10 and price reversed to -$50
 ```
 
-**V7 Fix - Trailing vs Fixed Target Logic:**
-- If profit never reaches $20 (GridTrailStart): Uses fixed target ($10)
-- Once peak profit reaches $20+: Trailing mode activates, **fixed target is IGNORED**
-- This allows profits to run beyond $10 when momentum is strong
+**V7 Trailing-Only Exit Strategy:**
+
+For **no-hedge strategies with trailing** (A2, B2, B8) and **hedge strategies when hedge is NOT triggered** (B6, B7, B9):
+- **NO fixed profit target** - wait for trailing to activate
+- Exit ONLY via: **Trailing stop** OR **Stop loss**
+- Wait for profit to reach $20 (GridTrailStart), then trail by $10 (GridTrailStep)
 
 ```
-Example - How Trailing and Fixed Target Interact:
+Example - Trailing-Only Exit:
 
-Scenario A: Profit rises slowly
-- Profit: 0 → 5 → 10 → CLOSE at $10 (fixed target, trailing never activated)
+Scenario: Profit rises and trails
+- Profit: 0 → 5 → 10 → 15 → 20 → 25 (peak) → 20 → 15 → CLOSE at $15
+- Trail activates at $20, trail level = peak - $10
+- At peak $25: trail level = $15
+- Closes when profit drops to trail level
+- Result: $15 profit (not $10!)
 
-Scenario B: Profit spikes then drops
-- Profit: 0 → 5 → 25 (peak) → 20 → 16 → CLOSE at $15
-- Trail level = $25 - $10 = $15
-- Fixed target ($10) is IGNORED once trailing activates
-- Result: $15 profit instead of $10!
+Scenario: Profit never reaches trailing threshold
+- Profit: 0 → 5 → 10 → 15 → stays flat → eventually hits STOP LOSS
+- Trailing never activates (peak < $20)
+- No fixed target closes at $10 - must wait for trailing or stop loss
 ```
 
-**Important:** Grid trailing is DISABLED when hedge triggers. Why?
-- After hedge triggers, you need to recover hedge losses
-- Fixed target ensures you wait for full recovery
-- Trailing might close too early with partial recovery
+**For hedge strategies when hedge IS triggered:**
+- Fixed profit target (BasketProfit) is used for recovery
+- Trailing is disabled - need fixed target to ensure full recovery
 
 ---
 
@@ -1279,6 +1283,12 @@ During March and November, there are brief periods when one market has switched 
       - Now: Direction ALWAYS switches after stop loss (BUY → SELL or SELL → BUY)
       - Also calls ResetEngine() to ensure clean state for new cycle
       - Affects: A3, A4, A5, A6, A7, B3, B4, B5, B6, B7, B9 (11 files fixed)
+    - **Trailing-Only Exit Fix (ALL trailing strategies)**:
+      - Previously: Fixed profit target ($10) closed trades before trailing could activate
+      - Now: NO fixed profit target for trailing strategies - wait for trailing or stop loss
+      - Trailing-only files: A2, B2, B8 (no-hedge with trailing)
+      - Hedge files with trailing (B6, B7, B9): Use trailing-only when hedge NOT triggered
+      - Fixed target only used when hedge IS triggered (for recovery)
   - **NEW: Consistent Dual Window Schedule (MODE_DUAL_WINDOW)**:
     - **Monday-Friday**: Same windows - 11:00-15:30 + 17:30-19:30 UTC+3
     - **Saturday**: No trading (market closes at 01:00 UTC+3, before our windows)
