@@ -1023,12 +1023,13 @@ void OnTick()
          return;
       }
 
-      // CHECK PROFIT CLOSE CONDITIONS
-      bool trailingActive = (gridPeakProfit >= GridTrailStart);
+      // CHECK TRAILING STOP (NO FIXED PROFIT TARGET for no-hedge + trailing strategy)
+      // Exit ONLY via: 1) Trailing stop, or 2) Stop loss
+      // Wait for profit to reach GridTrailStart, then trail by GridTrailStep
 
-      if(trailingActive)
+      if(gridPeakProfit >= GridTrailStart)
       {
-         // TRAILING MODE: Close when profit drops GridTrailStep from peak
+         // TRAILING MODE ACTIVE: Close when profit drops GridTrailStep from peak
          double trailLevel = gridPeakProfit - GridTrailStep;
 
          if(gridProfit <= trailLevel)
@@ -1038,19 +1039,9 @@ void OnTick()
             Dashboard();
             return;
          }
-         // In trailing mode, let profits run - don't check fixed target
+         // Let profits run until trail level is hit
       }
-      else
-      {
-         // NOT IN TRAILING MODE: Use fixed profit target
-         if(gridProfit >= BasketProfit)
-         {
-            Print("FIXED TARGET reached: Profit=", gridProfit, " Target=", BasketProfit);
-            RequestCloseAll(false);
-            Dashboard();
-            return;
-         }
-      }
+      // If trailing not yet active, just wait (no fixed profit target)
 
       // If outside trading hours but have positions, we managed them above
       // Now check if we should force close or just wait
