@@ -1523,14 +1523,13 @@ void OnTick()
             return;  // Just manage hedge, wait for profit target
          }
       }
-      // CASE B: No hedge triggered - use grid trailing stop / fixed target
+      // CASE B: No hedge triggered - use TRAILING ONLY (no fixed profit target)
       else
       {
-         bool trailingActive = (gridPeakProfit >= GridTrailStart);
-
-         if(trailingActive)
+         // Wait for profit to reach GridTrailStart, then trail by GridTrailStep
+         if(gridPeakProfit >= GridTrailStart)
          {
-            // TRAILING MODE: Close when profit drops GridTrailStep from peak
+            // TRAILING MODE ACTIVE: Close when profit drops GridTrailStep from peak
             double trailLevel = gridPeakProfit - GridTrailStep;
 
             if(gridProfit <= trailLevel)
@@ -1540,19 +1539,9 @@ void OnTick()
                Dashboard();
                return;
             }
-            // In trailing mode, let profits run
+            // Let profits run until trail level is hit
          }
-         else
-         {
-            // NOT IN TRAILING MODE: Use fixed profit target
-            if(gridProfit >= BasketProfit)
-            {
-               Print("FIXED TARGET reached: Profit=", gridProfit, " Target=", BasketProfit);
-               RequestCloseAll(false);
-               Dashboard();
-               return;
-            }
-         }
+         // If trailing not yet active, just wait (no fixed profit target)
       }
 
       // CHECK GRID LOSS LIMIT (triggers hedge)
