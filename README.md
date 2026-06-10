@@ -1273,6 +1273,12 @@ During March and November, there are brief periods when one market has switched 
       - Time filter only blocks opening NEW positions, not managing existing ones
     - **B8 No-Hedge Logic**: Removed basket profit pooling concepts (B8 has no hedge)
       - Clean grid-only logic with proper cycle reset between trades
+    - **Direction Switch Fix (ALL hedge files: A3-A7, B3-B7, B9)**:
+      - Previously: When stop loss hit WITHOUT hedge open, direction did NOT switch
+      - Bug: Grid BUY hits stop loss → pause → next cycle opens BUY again (wrong!)
+      - Now: Direction ALWAYS switches after stop loss (BUY → SELL or SELL → BUY)
+      - Also calls ResetEngine() to ensure clean state for new cycle
+      - Affects: A3, A4, A5, A6, A7, B3, B4, B5, B6, B7, B9 (11 files fixed)
   - **NEW: Consistent Dual Window Schedule (MODE_DUAL_WINDOW)**:
     - **Monday-Friday**: Same windows - 11:00-15:30 + 17:30-19:30 UTC+3
     - **Saturday**: No trading (market closes at 01:00 UTC+3, before our windows)
