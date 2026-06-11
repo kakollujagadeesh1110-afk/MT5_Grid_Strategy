@@ -2,7 +2,7 @@
 
 ## Overview
 
-This folder contains **16 Expert Advisor (EA) variations** for MetaTrader 5, designed for XAUUSD (Gold) trading using grid strategies with optional hedging features.
+This folder contains **17 Expert Advisor (EA) variations** for MetaTrader 5, designed for XAUUSD (Gold) trading using grid strategies with optional hedging features.
 
 ---
 
@@ -45,8 +45,11 @@ Each file follows the pattern: `{Series}{Number}_{grid-type}_{hedge}_{pooling}_{
 | B7_incr_hedge_pool_dual_trail | Incremental | Yes | Yes | Yes | Yes | Yes |
 | **B8_incr_nohedge_trail_time** | **Incremental** | **No** | **N/A** | **Yes** | **N/A** | **N/A** |
 | **B9_incr_hedge_pool_trail_time** | **Incremental** | **Yes** | **Yes** | **Yes** | **Yes** | **No** |
+| **B10_incr_nohedge_dynamic_trail** | **Incremental** | **No** | **N/A** | **Yes** | **N/A** | **N/A** |
 
-**NEW (V7):** B8 and B9 include **consistent dual trading windows** with comprehensive filters:
+**NEW (V8):** B10 includes **dynamic stop loss**, **daily limits**, and **24/7 trading** - see section below.
+
+**B8 and B9:** Include **consistent dual trading windows** with comprehensive filters:
 
 **Trading Schedule (MODE_DUAL_WINDOW - Default):**
 | Day | Window 1 | Gap (Skipped) | Window 2 | Total Hours |
@@ -1245,6 +1248,166 @@ During March and November, there are brief periods when one market has switched 
 | Ranging market | B7, B6, or **B9** (full featured) |
 | Most sophisticated | **B9** (incr + hedge + pool + trail + time) |
 | Simplest with time filter | **B8** (incr + trail + time) |
+| **24/7 with dynamic features** | **B10** (incr + dynamic SL + daily limits) |
+
+---
+
+## B10: Advanced Dynamic Strategy (NEW in V8)
+
+### Overview
+
+B10 is a specialized strategy designed for **24/7 automated trading** with intelligent risk management:
+
+| Feature | Description |
+|---------|-------------|
+| Grid Type | Incremental (200 × N points) |
+| Hedging | NO |
+| Profit Exit | Trailing Stop ONLY (no fixed target) |
+| Stop Loss | DYNAMIC ($75 - $300 based on day profit) |
+| Time Filters | NONE (runs 24/7, year-round) |
+| Direction | ALWAYS switches after every trade |
+
+### Key Features
+
+#### 1. Dynamic Stop Loss
+
+The stop loss adjusts based on the day's cumulative profit:
+
+```
+IF dayProfit <= $85:
+   stopLoss = $75 (minimum)
+ELSE:
+   stopLoss = dayProfit - $10 (capped at $300)
+```
+
+| Day Profit | Stop Loss Applied |
+|------------|-------------------|
+| $0 - $85 | $75 (minimum) |
+| $100 | $90 |
+| $150 | $140 |
+| $200 | $190 |
+| $310+ | $300 (maximum) |
+
+**Why?** Protects profits as they accumulate. Early in the day, use tight stop loss. As profits grow, allow more room for trades to breathe.
+
+#### 2. Dynamic Pause Time After Stop Loss
+
+Different pause durations based on stop loss amount hit:
+
+| Stop Loss Hit | Pause Duration | Reason |
+|---------------|----------------|--------|
+| < $150 | 0 minutes | Small loss, continue immediately |
+| $150 - $199 | 30 minutes | Moderate loss, brief cooldown |
+| $200 - $249 | 45 minutes | Significant loss, longer cooldown |
+| $250 - $300 | 60 minutes | Large loss, full hour reset |
+
+**Direction always switches** regardless of pause duration.
+
+#### 3. Daily Target
+
+- Input: `DailyTarget = 200.0` (default)
+- When day's net profit reaches target, stop opening new trades
+- Active grid continues until closed (trailing/stop loss)
+- Resets at midnight (00:00 UTC+3)
+
+#### 4. Daily Loss Limit
+
+- Input: `DailyLossLimit = 500.0` (default)
+- When day's net loss reaches limit, stop opening new trades
+- Protects against catastrophic daily losses
+- Resets at midnight (00:00 UTC+3)
+
+#### 5. Market Pause Buffers
+
+Optional pauses around market open/close times:
+
+- `PauseMinutesAfterMarketOpen = 0` (default)
+- `PauseMinutesBeforeMarketClose = 0` (default)
+
+**XAUUSD Market Hours (UTC+3):**
+| Day | Open | Close | Duration |
+|-----|------|-------|----------|
+| Mon-Fri | 01:00 | 00:00 (next day) | 23 hours |
+| Daily Maintenance | 00:00 - 01:00 | | 1 hour |
+| Weekend | Sat 01:00 - Mon 01:00 | | Closed |
+
+**Active trade handling:** If a grid is open when pause starts, it continues to be managed (can close via trailing/stop loss).
+
+#### 6. Direction Always Switches
+
+After **every** completed trade (profit OR loss), direction switches:
+- BUY grid closes → Next grid is SELL
+- SELL grid closes → Next grid is BUY
+- No exceptions, regardless of close reason
+
+### B10 Input Parameters
+
+```cpp
+//--- GRID SETTINGS ---
+input double LotSize                      = 0.01;
+input int    MaxTrades                    = 10;
+input int    BaseGridDistance             = 200;    // Points
+input int    GridIncrementStep            = 200;    // Points
+
+//--- TRAILING STOP ---
+input double GridTrailStart               = 20.0;   // Activate at this profit ($)
+input double GridTrailStep                = 10.0;   // Trail by this amount ($)
+
+//--- DYNAMIC STOP LOSS ---
+input double MinStopLoss                  = 75.0;   // Minimum stop loss ($)
+input double MaxStopLoss                  = 300.0;  // Maximum stop loss ($)
+input double DynamicSLThreshold           = 85.0;   // Day profit threshold ($)
+
+//--- DAILY LIMITS ---
+input double DailyTarget                  = 200.0;  // Stop when reached ($)
+input double DailyLossLimit               = 500.0;  // Stop when loss reaches this ($)
+
+//--- MARKET PAUSE BUFFERS ---
+input int    PauseMinutesAfterMarketOpen  = 0;      // Minutes after 01:00
+input int    PauseMinutesBeforeMarketClose = 0;     // Minutes before 00:00
+```
+
+### B10 Example Trading Day
+
+```
+Day starts: Monday 01:00 UTC+3
+dayNetProfit = $0
+Dynamic Stop Loss = $75 (minimum)
+
+Trade 1 (BUY grid):
+├── Opens at 01:00
+├── Trailing stop hits at +$30
+├── dayNetProfit = $30
+├── Dynamic SL still $75 (profit < $85)
+└── Direction switches to SELL
+
+Trade 2 (SELL grid):
+├── Opens immediately (no pause for profit)
+├── Trailing stop hits at +$60
+├── dayNetProfit = $90
+├── Dynamic SL now = $90 - $10 = $80
+└── Direction switches to BUY
+
+Trade 3 (BUY grid):
+├── Opens immediately
+├── Stop loss hits at -$80
+├── dayNetProfit = $90 - $80 = $10
+├── Dynamic SL resets to $75 (profit < $85)
+├── Direction switches to SELL
+└── NO pause (SL $80 < $150)
+
+Trade 4 (SELL grid):
+├── Opens immediately
+├── Trailing stop hits at +$200
+├── dayNetProfit = $210
+├── Daily target ($200) REACHED!
+└── No new trades for rest of day
+
+Tuesday 01:00:
+├── dayNetProfit resets to $0
+├── Dynamic SL = $75
+└── Trade 5 (BUY) opens - continues alternating
+```
 
 ---
 
@@ -1263,7 +1426,7 @@ During March and November, there are brief periods when one market has switched 
 - **v6**: Enhanced B8 and B9 with comprehensive filters and controls
   - Added dual trading window mode
   - Added day-of-week filter
-- **v7 (Current)**: Bug fixes + Consistent trading windows for B8 and B9
+- **v7**: Bug fixes + Consistent trading windows for B8 and B9
   - **B8**: Incremental + No Hedge + Trail + Consistent Time Filter
   - **B9**: Incremental + Hedge + Pool + Trail + Consistent Time Filter
   - **CRITICAL BUG FIXES**:
@@ -1305,6 +1468,24 @@ During March and November, there are brief periods when one market has switched 
     - Overall trading status with clear day/time context
   - All features work year-round with automatic DST handling
   - 16 total strategy variations available
+- **v8 (Current)**: Added B10 with dynamic features for 24/7 trading
+  - **B10**: Incremental + No Hedge + Dynamic Stop Loss + Trailing Only
+  - **NEW FEATURES**:
+    - **Dynamic Stop Loss**: Adjusts from $75-$300 based on day profit
+      - If dayProfit <= $85: Use minimum $75
+      - If dayProfit > $85: Use (dayProfit - $10), capped at $300
+    - **Dynamic Pause After Stop Loss**: 0/30/45/60 minutes based on loss size
+      - < $150: No pause
+      - $150-$199: 30 minutes
+      - $200-$249: 45 minutes
+      - $250-$300: 60 minutes
+    - **Daily Target**: Stop trading when day profit reaches target (default $200)
+    - **Daily Loss Limit**: Stop trading when day loss reaches limit (default $500)
+    - **Market Pause Buffers**: Optional pause after market open / before market close
+    - **Direction Always Switches**: After every trade (profit or loss), direction alternates
+  - **24/7 Trading**: No day/time filters - runs continuously year-round
+  - **XAUUSD Market Hours Support**: Handles daily maintenance (00:00-01:00) and weekends
+  - 17 total strategy variations available
 
 ---
 
