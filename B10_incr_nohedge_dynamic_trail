@@ -61,9 +61,9 @@ input int    PauseMinutesBeforeMarketClose = 0;     // Minutes to pause before m
 
 //---------------- SAFETY ----------------//
 
-input int    MagicNumber                  = 101010;
-input int    Slippage                     = 30;
-input double MaxSpread                    = 50;     // Max spread in points
+input ulong  MagicNumber                  = 101010;
+input ulong  Slippage                     = 30;
+input int    MaxSpread                    = 50;     // Max spread in points
 
 //+------------------------------------------------------------------+
 //| GLOBAL VARIABLES                                                 |
@@ -303,7 +303,7 @@ bool CanOpenNewTrades()
 //+------------------------------------------------------------------+
 bool SpreadOK()
 {
-   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    return (spread <= MaxSpread);
 }
 
@@ -356,7 +356,7 @@ int TotalOurPositions()
    {
       if(PositionSelectByTicket(PositionGetTicket(i)))
       {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             PositionGetString(POSITION_SYMBOL) == _Symbol)
             count++;
       }
@@ -374,7 +374,7 @@ int CountGridPositions(ENUM_POSITION_TYPE type)
    {
       if(PositionSelectByTicket(PositionGetTicket(i)))
       {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             PositionGetString(POSITION_SYMBOL) == _Symbol &&
             PositionGetInteger(POSITION_TYPE) == type)
             count++;
@@ -393,7 +393,7 @@ double GetGridProfit()
    {
       if(PositionSelectByTicket(PositionGetTicket(i)))
       {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             PositionGetString(POSITION_SYMBOL) == _Symbol)
          {
             profit += PositionGetDouble(POSITION_PROFIT) +
@@ -416,7 +416,7 @@ double GetOuterGridPrice(ENUM_POSITION_TYPE type)
    {
       if(PositionSelectByTicket(PositionGetTicket(i)))
       {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             PositionGetString(POSITION_SYMBOL) == _Symbol &&
             PositionGetInteger(POSITION_TYPE) == type)
          {
@@ -506,7 +506,7 @@ void ProcessCloseAll()
       if(!PositionSelectByTicket(ticket))
          continue;
 
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
          continue;
 
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
