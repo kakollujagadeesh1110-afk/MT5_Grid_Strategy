@@ -1,0 +1,819 @@
+//+------------------------------------------------------------------+
+//|                              B10_incr_nohedge_dynamic_trail.mq5  |
+//|                                                                  |
+//|  STRATEGY: Incremental Grid + No Hedge + Dynamic Stop Loss       |
+//|            + Trailing Stop Only + Daily Target/Loss Limits       |
+//|                                                                  |
+//|  FEATURES:                                                       |
+//|  - Incremental grid distance (200 * N points)                    |
+//|  - NO hedging                                                    |
+//|  - Trailing stop ONLY (no fixed profit target)                   |
+//|  - Dynamic stop loss based on day profit ($75-$300)              |
+//|  - Dynamic pause time after stop loss (0/30/45/60 mins)          |
+//|  - Daily profit target (stop when reached)                       |
+//|  - Daily loss limit (stop when reached)                          |
+//|  - Market pause buffers (after open / before close)              |
+//|  - Direction ALWAYS switches after every trade                   |
+//|  - 24/7 trading (no day/time filters)                            |
+//|                                                                  |
+//|  XAUUSD MARKET HOURS (UTC+3):                                    |
+//|  - Daily: 01:00 to 00:00 (23 hours)                              |
+//|  - Maintenance: 00:00 to 01:00 (1 hour daily)                    |
+//|  - Weekend: Saturday 01:00 to Monday 01:00 (closed)              |
+//+------------------------------------------------------------------+
+#property copyright "B10 Strategy"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                 |
+//+------------------------------------------------------------------+
+
+//---------------- GRID SETTINGS ----------------//
+
+input double LotSize                      = 0.01;
+input int    MaxTrades                    = 10;
+input int    BaseGridDistance             = 200;    // Base distance in points
+input int    GridIncrementStep            = 200;    // Increment per grid level
+
+//---------------- TRAILING STOP ----------------//
+
+input double GridTrailStart               = 20.0;   // Start trailing at this profit ($)
+input double GridTrailStep                = 10.0;   // Trail by this amount ($)
+
+//---------------- DYNAMIC STOP LOSS ----------------//
+
+input double MinStopLoss                  = 75.0;   // Minimum stop loss ($)
+input double MaxStopLoss                  = 300.0;  // Maximum stop loss ($)
+input double DynamicSLThreshold           = 85.0;   // Day profit threshold for dynamic SL ($)
+
+//---------------- DAILY LIMITS ----------------//
+
+input double DailyTarget                  = 200.0;  // Stop trading when day profit reaches this ($)
+input double DailyLossLimit               = 500.0;  // Stop trading when day loss reaches this ($)
+
+//---------------- MARKET PAUSE BUFFERS ----------------//
+
+input int    PauseMinutesAfterMarketOpen  = 0;      // Minutes to pause after market open (01:00)
+input int    PauseMinutesBeforeMarketClose = 0;     // Minutes to pause before market close (00:00)
+
+//---------------- SAFETY ----------------//
+
+input int    MagicNumber                  = 101010;
+input int    Slippage                     = 30;
+input double MaxSpread                    = 50;     // Max spread in points
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                 |
+//+------------------------------------------------------------------+
+
+CTrade trade;
+
+int currentDirection = -1;  // -1 = not set, 0 = BUY, 1 = SELL
+
+double gridPeakProfit = 0.0;
+
+datetime lastTradeTime = 0;
+
+// Daily tracking
+double dayNetProfit = 0.0;
+int lastDayOfYear = -1;
+
+// Pause management
+datetime pauseUntil = 0;
+
+// Close management
+bool closeAllPending = false;
+bool closeAfterLoss = false;
+double lastStopLossAmount = 0.0;
+
+//+------------------------------------------------------------------+
+//| EXPERT INITIALIZATION                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   // Initialize day tracking
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   lastDayOfYear = dt.day_of_year;
+   dayNetProfit = 0.0;
+
+   // Set initial direction if not set
+   if(currentDirection == -1)
+      currentDirection = 0;  // Start with BUY
+
+   Print("B10 Initialized: Dynamic SL=$", MinStopLoss, "-$", MaxStopLoss,
+         " | Daily Target=$", DailyTarget, " | Daily Loss Limit=$", DailyLossLimit);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT DEINITIALIZATION                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF NEW DAY - RESET DAILY COUNTERS                          |
+//+------------------------------------------------------------------+
+void CheckDayReset()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(dt.day_of_year != lastDayOfYear)
+   {
+      // New day - reset counters
+      Print("NEW DAY RESET: Previous dayNetProfit=$", dayNetProfit);
+      dayNetProfit = 0.0;
+      lastDayOfYear = dt.day_of_year;
+      Print("Day counters reset. New day started.");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| GET CURRENT DYNAMIC STOP LOSS                                    |
+//+------------------------------------------------------------------+
+double GetDynamicStopLoss()
+{
+   double stopLoss;
+
+   if(dayNetProfit <= DynamicSLThreshold)
+   {
+      // Day profit is at or below threshold - use minimum
+      stopLoss = MinStopLoss;
+   }
+   else
+   {
+      // Day profit above threshold - dynamic calculation
+      stopLoss = dayNetProfit - 10.0;
+
+      // Apply min/max bounds
+      if(stopLoss < MinStopLoss)
+         stopLoss = MinStopLoss;
+      if(stopLoss > MaxStopLoss)
+         stopLoss = MaxStopLoss;
+   }
+
+   return stopLoss;
+}
+
+//+------------------------------------------------------------------+
+//| GET PAUSE DURATION BASED ON STOP LOSS AMOUNT                     |
+//+------------------------------------------------------------------+
+int GetPauseDurationMinutes(double stopLossAmount)
+{
+   if(stopLossAmount < 150.0)
+      return 0;   // No pause
+   else if(stopLossAmount < 200.0)
+      return 30;  // 30 minutes
+   else if(stopLossAmount < 250.0)
+      return 45;  // 45 minutes
+   else
+      return 60;  // 60 minutes (250-300)
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF MARKET IS OPEN                                          |
+//+------------------------------------------------------------------+
+bool IsMarketOpen()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   // Weekend check: Saturday and Sunday
+   // Saturday (day_of_week = 6): Market closes at 01:00, so after 01:00 it's closed
+   // Sunday (day_of_week = 0): Market is closed all day
+   // Monday (day_of_week = 1): Market opens at 01:00
+
+   if(dt.day_of_week == 0)  // Sunday
+      return false;
+
+   if(dt.day_of_week == 6)  // Saturday
+   {
+      // Market closes at 01:00 Saturday
+      if(dt.hour >= 1)
+         return false;
+      else
+         return true;  // 00:00 - 00:59 Saturday (technically still Friday's session)
+   }
+
+   // Monday to Friday
+   // Daily maintenance: 00:00 to 01:00
+   if(dt.hour == 0)
+      return false;  // Maintenance hour
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF IN MARKET PAUSE BUFFER                                  |
+//+------------------------------------------------------------------+
+bool IsInMarketPauseBuffer()
+{
+   if(PauseMinutesAfterMarketOpen == 0 && PauseMinutesBeforeMarketClose == 0)
+      return false;
+
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   // Skip weekends
+   if(dt.day_of_week == 0 || (dt.day_of_week == 6 && dt.hour >= 1))
+      return false;
+
+   // Market opens at 01:00, closes at 00:00 (next day)
+   int currentMinuteOfDay = dt.hour * 60 + dt.min;
+   int marketOpenMinute = 1 * 60;  // 01:00 = 60 minutes from midnight
+   int marketCloseMinute = 24 * 60;  // 00:00 next day = 1440 minutes
+
+   // Check pause after market open
+   if(PauseMinutesAfterMarketOpen > 0)
+   {
+      int pauseEndMinute = marketOpenMinute + PauseMinutesAfterMarketOpen;
+      if(currentMinuteOfDay >= marketOpenMinute && currentMinuteOfDay < pauseEndMinute)
+         return true;
+   }
+
+   // Check pause before market close
+   if(PauseMinutesBeforeMarketClose > 0)
+   {
+      int pauseStartMinute = marketCloseMinute - PauseMinutesBeforeMarketClose;
+      if(currentMinuteOfDay >= pauseStartMinute)
+         return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF DAILY TARGET REACHED                                    |
+//+------------------------------------------------------------------+
+bool IsDailyTargetReached()
+{
+   return (dayNetProfit >= DailyTarget);
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF DAILY LOSS LIMIT REACHED                                |
+//+------------------------------------------------------------------+
+bool IsDailyLossLimitReached()
+{
+   return (dayNetProfit <= -DailyLossLimit);
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF CAN OPEN NEW TRADES                                     |
+//+------------------------------------------------------------------+
+bool CanOpenNewTrades()
+{
+   // Check market is open
+   if(!IsMarketOpen())
+      return false;
+
+   // Check market pause buffers
+   if(IsInMarketPauseBuffer())
+      return false;
+
+   // Check if in dynamic pause (after stop loss)
+   if(pauseUntil > 0 && TimeCurrent() < pauseUntil)
+      return false;
+
+   // Check daily target
+   if(IsDailyTargetReached())
+      return false;
+
+   // Check daily loss limit
+   if(IsDailyLossLimitReached())
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| SPREAD CHECK                                                     |
+//+------------------------------------------------------------------+
+bool SpreadOK()
+{
+   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   return (spread <= MaxSpread);
+}
+
+//+------------------------------------------------------------------+
+//| ALLOW TRADING                                                    |
+//+------------------------------------------------------------------+
+bool AllowTrading()
+{
+   if(!SpreadOK())
+      return false;
+
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return false;
+
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return false;
+
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return false;
+
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE LOT SIZE                                               |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathMax(minLot, lot);
+   lot = MathMin(maxLot, lot);
+   lot = MathRound(lot / lotStep) * lotStep;
+
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| COUNT OUR POSITIONS                                              |
+//+------------------------------------------------------------------+
+int TotalOurPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+            count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| COUNT GRID POSITIONS BY TYPE                                     |
+//+------------------------------------------------------------------+
+int CountGridPositions(ENUM_POSITION_TYPE type)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == type)
+            count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| GET GRID PROFIT                                                  |
+//+------------------------------------------------------------------+
+double GetGridProfit()
+{
+   double profit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            profit += PositionGetDouble(POSITION_PROFIT) +
+                      PositionGetDouble(POSITION_SWAP);
+         }
+      }
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| GET OUTER GRID PRICE                                             |
+//+------------------------------------------------------------------+
+double GetOuterGridPrice(ENUM_POSITION_TYPE type)
+{
+   double price = 0;
+   bool found = false;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == type)
+         {
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+
+            if(!found)
+            {
+               price = openPrice;
+               found = true;
+            }
+            else
+            {
+               if(type == POSITION_TYPE_BUY && openPrice < price)
+                  price = openPrice;
+               else if(type == POSITION_TYPE_SELL && openPrice > price)
+                  price = openPrice;
+            }
+         }
+      }
+   }
+
+   return price;
+}
+
+//+------------------------------------------------------------------+
+//| GET INCREMENTAL GRID DISTANCE                                    |
+//+------------------------------------------------------------------+
+int GetIncrementalGridDistance()
+{
+   int gridCount;
+
+   if(currentDirection == 0)
+      gridCount = CountGridPositions(POSITION_TYPE_BUY);
+   else
+      gridCount = CountGridPositions(POSITION_TYPE_SELL);
+
+   // Distance = BaseGridDistance + (GridLevel * GridIncrementStep)
+   // Level 0 (first position): BaseGridDistance
+   // Level 1: BaseGridDistance + GridIncrementStep
+   // Level 2: BaseGridDistance + 2*GridIncrementStep
+   // etc.
+
+   return BaseGridDistance + (gridCount * GridIncrementStep);
+}
+
+//+------------------------------------------------------------------+
+//| RESET ENGINE                                                     |
+//+------------------------------------------------------------------+
+void ResetEngine()
+{
+   gridPeakProfit = 0.0;
+   closeAllPending = false;
+   closeAfterLoss = false;
+}
+
+//+------------------------------------------------------------------+
+//| SWITCH DIRECTION                                                 |
+//+------------------------------------------------------------------+
+void SwitchDirection()
+{
+   if(currentDirection == 0)
+      currentDirection = 1;
+   else
+      currentDirection = 0;
+
+   Print("DIRECTION SWITCHED to: ", (currentDirection == 0) ? "BUY" : "SELL");
+}
+
+//+------------------------------------------------------------------+
+//| REQUEST CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void RequestCloseAll(bool lossMode, double lossAmount = 0.0)
+{
+   closeAllPending = true;
+   closeAfterLoss = lossMode;
+   lastStopLossAmount = lossAmount;
+}
+
+//+------------------------------------------------------------------+
+//| PROCESS CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void ProcessCloseAll()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      trade.PositionClose(ticket);
+   }
+
+   if(TotalOurPositions() == 0)
+   {
+      // Record the realized profit/loss
+      // Note: This will be captured from the last trade profit
+      // For accurate tracking, we get the profit before closing
+
+      // Switch direction (ALWAYS)
+      SwitchDirection();
+
+      ResetEngine();
+
+      if(closeAfterLoss && lastStopLossAmount > 0)
+      {
+         // Apply dynamic pause based on stop loss amount
+         int pauseMinutes = GetPauseDurationMinutes(lastStopLossAmount);
+
+         if(pauseMinutes > 0)
+         {
+            pauseUntil = TimeCurrent() + (pauseMinutes * 60);
+            Print("PAUSE ACTIVATED: ", pauseMinutes, " minutes due to stop loss of $", lastStopLossAmount);
+         }
+         else
+         {
+            pauseUntil = 0;
+            Print("NO PAUSE: Stop loss $", lastStopLossAmount, " < $150");
+         }
+      }
+      else
+      {
+         pauseUntil = 0;
+      }
+
+      closeAllPending = false;
+      closeAfterLoss = false;
+      lastStopLossAmount = 0.0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OPEN FIRST TRADE                                                 |
+//+------------------------------------------------------------------+
+void OpenFirstTrade()
+{
+   if(!AllowTrading())
+      return;
+
+   if(!CanOpenNewTrades())
+      return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   bool result = false;
+
+   if(currentDirection == 0)
+   {
+      result = trade.Buy(NormalizeLot(LotSize), _Symbol, ask, 0, 0, "B10_GridBuy");
+   }
+   else
+   {
+      result = trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "B10_GridSell");
+   }
+
+   if(result)
+   {
+      lastTradeTime = TimeCurrent();
+      Print("FIRST TRADE OPENED: ", (currentDirection == 0) ? "BUY" : "SELL",
+            " | Dynamic SL: $", GetDynamicStopLoss());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE GRID                                                      |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   if(!AllowTrading())
+      return;
+
+   // Don't add to grid if can't open new trades (but still manage existing)
+   if(!CanOpenNewTrades())
+      return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   int requiredDistance = GetIncrementalGridDistance();
+
+   if(currentDirection == 0)  // BUY GRID
+   {
+      int count = CountGridPositions(POSITION_TYPE_BUY);
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer = GetOuterGridPrice(POSITION_TYPE_BUY);
+      double distance = (outer - bid) / _Point;
+
+      if(distance >= requiredDistance)
+      {
+         bool result = trade.Buy(NormalizeLot(LotSize), _Symbol, ask, 0, 0, "B10_GridBuy");
+
+         if(result)
+            lastTradeTime = TimeCurrent();
+      }
+   }
+   else  // SELL GRID
+   {
+      int count = CountGridPositions(POSITION_TYPE_SELL);
+
+      if(count >= MaxTrades)
+         return;
+
+      double outer = GetOuterGridPrice(POSITION_TYPE_SELL);
+      double distance = (ask - outer) / _Point;
+
+      if(distance >= requiredDistance)
+      {
+         bool result = trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "B10_GridSell");
+
+         if(result)
+            lastTradeTime = TimeCurrent();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD                                                        |
+//+------------------------------------------------------------------+
+void Dashboard()
+{
+   double gridProfit = GetGridProfit();
+   double currentStopLoss = GetDynamicStopLoss();
+   int gridCount = TotalOurPositions();
+
+   string pauseStatus = "NO";
+   if(pauseUntil > 0 && TimeCurrent() < pauseUntil)
+   {
+      int remainingSecs = (int)(pauseUntil - TimeCurrent());
+      pauseStatus = "YES (" + IntegerToString(remainingSecs / 60) + "m " +
+                    IntegerToString(remainingSecs % 60) + "s)";
+   }
+
+   string marketStatus = IsMarketOpen() ? "OPEN" : "CLOSED";
+   string bufferStatus = IsInMarketPauseBuffer() ? "YES" : "NO";
+   string dailyTargetStatus = IsDailyTargetReached() ? "REACHED!" : "Active";
+   string dailyLossStatus = IsDailyLossLimitReached() ? "REACHED!" : "Active";
+
+   string trailStatus = "Waiting";
+   double trailLevel = 0;
+   if(gridPeakProfit >= GridTrailStart)
+   {
+      trailStatus = "ACTIVE";
+      trailLevel = gridPeakProfit - GridTrailStep;
+   }
+
+   Comment(
+      "=== B10: INCREMENTAL GRID - DYNAMIC STOP LOSS ===\n",
+
+      "\n--- GRID STATUS ---",
+      "\nPositions: ", IntegerToString(gridCount),
+      "\nDirection: ", (currentDirection == 0) ? "BUY" : "SELL",
+      "\nNext Distance: ", IntegerToString(GetIncrementalGridDistance()), " pts",
+
+      "\n\n--- PROFIT/LOSS ---",
+      "\nGrid Floating P/L: $", DoubleToString(gridProfit, 2),
+      "\nDay Net Profit: $", DoubleToString(dayNetProfit, 2),
+
+      "\n\n--- TRAILING STOP ---",
+      "\nPeak Profit: $", DoubleToString(gridPeakProfit, 2),
+      "\nTrail Start: $", DoubleToString(GridTrailStart, 2),
+      "\nTrail Step: $", DoubleToString(GridTrailStep, 2),
+      "\nTrail Status: ", trailStatus,
+      "\nTrail Level: ", (trailStatus == "ACTIVE") ? ("$" + DoubleToString(trailLevel, 2)) : "N/A",
+
+      "\n\n--- DYNAMIC STOP LOSS ---",
+      "\nCurrent Stop Loss: $", DoubleToString(currentStopLoss, 2),
+      "\nMin/Max SL: $", DoubleToString(MinStopLoss, 2), " / $", DoubleToString(MaxStopLoss, 2),
+      "\nSL Threshold: $", DoubleToString(DynamicSLThreshold, 2),
+
+      "\n\n--- DAILY LIMITS ---",
+      "\nDaily Target: $", DoubleToString(DailyTarget, 2), " (", dailyTargetStatus, ")",
+      "\nDaily Loss Limit: $", DoubleToString(DailyLossLimit, 2), " (", dailyLossStatus, ")",
+
+      "\n\n--- PAUSE STATUS ---",
+      "\nDynamic Pause: ", pauseStatus,
+      "\nMarket: ", marketStatus,
+      "\nIn Buffer Zone: ", bufferStatus,
+
+      "\n\n--- MARKET BUFFERS ---",
+      "\nPause After Open: ", IntegerToString(PauseMinutesAfterMarketOpen), " min",
+      "\nPause Before Close: ", IntegerToString(PauseMinutesBeforeMarketClose), " min"
+   );
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT TICK FUNCTION                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Check for new day and reset counters
+   CheckDayReset();
+
+   // Handle pending close operations
+   if(closeAllPending)
+   {
+      ProcessCloseAll();
+      Dashboard();
+      return;
+   }
+
+   // Check if in dynamic pause (after stop loss)
+   if(pauseUntil > 0 && TimeCurrent() < pauseUntil)
+   {
+      Dashboard();
+      return;
+   }
+
+   // Get current positions
+   int totalPositions = TotalOurPositions();
+
+   // STEP 1: If we have active positions, ALWAYS manage them
+   if(totalPositions > 0)
+   {
+      double gridProfit = GetGridProfit();
+
+      // Update peak profit for trailing
+      if(gridProfit > gridPeakProfit)
+         gridPeakProfit = gridProfit;
+
+      // Get current dynamic stop loss
+      double currentStopLoss = GetDynamicStopLoss();
+
+      // CHECK STOP LOSS FIRST (highest priority)
+      if(gridProfit <= -currentStopLoss)
+      {
+         Print("STOP LOSS triggered: GridProfit=$", gridProfit,
+               " | Dynamic SL=$", currentStopLoss,
+               " | Day Profit Before=$", dayNetProfit);
+
+         // Update day profit with this loss
+         dayNetProfit += gridProfit;
+
+         Print("Day Profit After Stop Loss: $", dayNetProfit);
+
+         RequestCloseAll(true, currentStopLoss);
+         Dashboard();
+         return;
+      }
+
+      // CHECK TRAILING STOP (NO fixed profit target)
+      if(gridPeakProfit >= GridTrailStart)
+      {
+         double trailLevel = gridPeakProfit - GridTrailStep;
+
+         if(gridProfit <= trailLevel)
+         {
+            Print("TRAILING STOP triggered: Peak=$", gridPeakProfit,
+                  " | Current=$", gridProfit,
+                  " | Trail Level=$", trailLevel,
+                  " | Day Profit Before=$", dayNetProfit);
+
+            // Update day profit with this profit
+            dayNetProfit += gridProfit;
+
+            Print("Day Profit After Trail Stop: $", dayNetProfit);
+
+            RequestCloseAll(false);
+            Dashboard();
+            return;
+         }
+         // In trailing mode, let profits run
+      }
+      // If trailing not yet active, just wait (no fixed profit target)
+
+      // Manage grid (add positions if allowed)
+      ManageGrid();
+
+      Dashboard();
+      return;
+   }
+
+   // STEP 2: No positions - check if we can open new trade
+   if(totalPositions == 0)
+   {
+      // Reset peak profit for new cycle
+      if(gridPeakProfit > 0)
+         gridPeakProfit = 0.0;
+
+      // Check if we can open new trades
+      if(CanOpenNewTrades() && AllowTrading())
+      {
+         OpenFirstTrade();
+      }
+
+      Dashboard();
+      return;
+   }
+
+   Dashboard();
+}
+//+------------------------------------------------------------------+
