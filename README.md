@@ -794,9 +794,11 @@ Overall Status: TRADING ALLOWED
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | StopTradingBalance | 1100.0 | Stop if balance exceeds (for demo) |
-| MaxSpreadPoints | 80 | Skip trading if spread too high |
+| MaxSpreadPoints | 80 | Skip trading if spread too high (A/B1-B9) |
 | MinMarginLevel | 250.0 | Skip trading if margin too low |
 | TradeCooldownSeconds | 3 | Minimum seconds between trades |
+
+**Note:** B10 does NOT use MaxSpreadPoints - it relies on market pause buffers instead.
 
 ---
 
@@ -1365,7 +1367,13 @@ input double DailyLossLimit               = 500.0;  // Stop when loss reaches th
 //--- MARKET PAUSE BUFFERS ---
 input int    PauseMinutesAfterMarketOpen  = 0;      // Minutes after 01:00
 input int    PauseMinutesBeforeMarketClose = 0;     // Minutes before 00:00
+
+//--- SAFETY ---
+input ulong  MagicNumber                  = 101010;
+input ulong  Slippage                     = 30;     // Max price deviation in points
 ```
+
+**Note:** B10 uses `SetTypeFillingBySymbol()` for automatic broker compatibility (no hardcoded fill type).
 
 ### B10 Example Trading Day
 
@@ -1485,6 +1493,11 @@ Tuesday 01:00:
     - **Direction Always Switches**: After every trade (profit or loss), direction alternates
   - **24/7 Trading**: No day/time filters - runs continuously year-round
   - **XAUUSD Market Hours Support**: Handles daily maintenance (00:00-01:00) and weekends
+  - **BUG FIXES (B10)**:
+    - **Realized P/L Tracking**: Day profit now uses actual balance difference after positions close (not floating P/L before close)
+    - **Daily Flags Persistence**: Daily target/loss limit flags now persist through input changes (only reset on new day or full EA restart)
+    - **Broker Compatibility**: Changed from hardcoded `ORDER_FILLING_IOC` to `SetTypeFillingBySymbol()` for auto-detection
+    - **Removed MaxSpread**: Unnecessary copy-paste from other strategies (market pause buffers already handle high-spread periods)
   - 17 total strategy variations available
 
 ---
