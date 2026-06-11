@@ -175,19 +175,32 @@ int OnInit()
 
    if(!restored)
    {
-      // Fresh start - initialize day tracking
+      // Check if we're already in the same day (EA reinit within same session)
       MqlDateTime dt;
       TimeCurrent(dt);
-      lastDayOfYear = dt.day_of_year;
-      dayNetProfit = 0.0;
-      dailyTargetReachedToday = false;
-      dailyLossLimitReachedToday = false;
+
+      if(lastDayOfYear == dt.day_of_year && lastDayOfYear != -1)
+      {
+         // Same day, same session - keep existing dayNetProfit
+         // This handles cases like chart timeframe change, template change, etc.
+         Print("B10 Reinit (same day): Keeping existing values - dayNetProfit=$",
+               DoubleToString(dayNetProfit, 2),
+               " | Direction=", (currentDirection == 0) ? "BUY" : "SELL");
+      }
+      else
+      {
+         // Different day or true fresh start (lastDayOfYear == -1)
+         lastDayOfYear = dt.day_of_year;
+         dayNetProfit = 0.0;
+         dailyTargetReachedToday = false;
+         dailyLossLimitReachedToday = false;
+
+         Print("B10 Fresh Start: Day tracking initialized");
+      }
 
       // Set initial direction if not set
       if(currentDirection == -1)
          currentDirection = 0;  // Start with BUY
-
-      Print("B10 Fresh Start: Day tracking initialized");
    }
 
    Print("B10 Initialized: Dynamic SL=$", MinStopLoss, "-$", MaxStopLoss,
@@ -201,12 +214,26 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   // Save daily values ONLY when inputs are changed (not on full restart)
-   // REASON_PARAMETERS = 5 (input parameters changed)
-   if(reason == REASON_PARAMETERS)
+   // Save daily values for reasons that should preserve state:
+   // REASON_PARAMETERS (5) = input parameters changed
+   // REASON_CHARTCHANGE (3) = chart symbol or timeframe changed
+   // REASON_TEMPLATE (7) = template applied
+   // REASON_RECOMPILE (2) = EA recompiled
+   //
+   // Do NOT save for full restarts:
+   // REASON_PROGRAM (0), REASON_REMOVE (1) = EA removed
+   // REASON_CHARTCLOSE (4) = chart closed
+   // REASON_ACCOUNT (6) = account changed
+   // REASON_INITFAILED (8) = init failed
+   // REASON_CLOSE (9) = terminal closing
+
+   if(reason == REASON_PARAMETERS ||
+      reason == REASON_CHARTCHANGE ||
+      reason == REASON_TEMPLATE ||
+      reason == REASON_RECOMPILE)
    {
       SaveDailyValuesToGV();
-      Print("OnDeinit: Input parameters changed - daily values saved");
+      Print("OnDeinit: Reason=", reason, " - daily values saved for restore");
    }
    else
    {
