@@ -63,7 +63,6 @@ input int    PauseMinutesBeforeMarketClose = 0;     // Minutes to pause before m
 
 input ulong  MagicNumber                  = 101010;
 input ulong  Slippage                     = 30;
-input int    MaxSpread                    = 50;     // Max spread in points
 
 //+------------------------------------------------------------------+
 //| GLOBAL VARIABLES                                                 |
@@ -75,11 +74,14 @@ int currentDirection = -1;  // -1 = not set, 0 = BUY, 1 = SELL
 
 double gridPeakProfit = 0.0;
 
-datetime lastTradeTime = 0;
-
 // Daily tracking
 double dayNetProfit = 0.0;
 int lastDayOfYear = -1;
+bool dailyTargetReachedToday = false;   // Persists even if inputs change
+bool dailyLossLimitReachedToday = false; // Persists even if inputs change
+
+// GlobalVariable names for persistence through input changes
+string gvPrefix = "B10_";  // Prefix for GlobalVariables
 
 // Pause management
 datetime pauseUntil = 0;
@@ -88,6 +90,76 @@ datetime pauseUntil = 0;
 bool closeAllPending = false;
 bool closeAfterLoss = false;
 double lastStopLossAmount = 0.0;
+double balanceBeforeClose = 0.0;  // Track balance to calculate realized P/L
+
+//+------------------------------------------------------------------+
+//| SAVE DAILY VALUES TO GLOBAL VARIABLES (for input changes)        |
+//+------------------------------------------------------------------+
+void SaveDailyValuesToGV()
+{
+   GlobalVariableSet(gvPrefix + "dayNetProfit", dayNetProfit);
+   GlobalVariableSet(gvPrefix + "lastDayOfYear", (double)lastDayOfYear);
+   GlobalVariableSet(gvPrefix + "dailyTargetReached", dailyTargetReachedToday ? 1.0 : 0.0);
+   GlobalVariableSet(gvPrefix + "dailyLossLimitReached", dailyLossLimitReachedToday ? 1.0 : 0.0);
+   GlobalVariableSet(gvPrefix + "currentDirection", (double)currentDirection);
+   GlobalVariableSet(gvPrefix + "pauseUntil", (double)pauseUntil);
+
+   Print("Daily values SAVED to GlobalVariables for input change persistence");
+}
+
+//+------------------------------------------------------------------+
+//| RESTORE DAILY VALUES FROM GLOBAL VARIABLES                       |
+//+------------------------------------------------------------------+
+bool RestoreDailyValuesFromGV()
+{
+   // Check if GlobalVariables exist
+   if(!GlobalVariableCheck(gvPrefix + "lastDayOfYear"))
+      return false;
+
+   // Get stored day
+   int storedDay = (int)GlobalVariableGet(gvPrefix + "lastDayOfYear");
+
+   // Get current day
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   // Only restore if same day
+   if(storedDay != dt.day_of_year)
+   {
+      // Different day - delete old GVs and return false
+      GlobalVariableDel(gvPrefix + "dayNetProfit");
+      GlobalVariableDel(gvPrefix + "lastDayOfYear");
+      GlobalVariableDel(gvPrefix + "dailyTargetReached");
+      GlobalVariableDel(gvPrefix + "dailyLossLimitReached");
+      GlobalVariableDel(gvPrefix + "currentDirection");
+      GlobalVariableDel(gvPrefix + "pauseUntil");
+      return false;
+   }
+
+   // Same day - restore values
+   dayNetProfit = GlobalVariableGet(gvPrefix + "dayNetProfit");
+   lastDayOfYear = storedDay;
+   dailyTargetReachedToday = (GlobalVariableGet(gvPrefix + "dailyTargetReached") == 1.0);
+   dailyLossLimitReachedToday = (GlobalVariableGet(gvPrefix + "dailyLossLimitReached") == 1.0);
+   currentDirection = (int)GlobalVariableGet(gvPrefix + "currentDirection");
+   pauseUntil = (datetime)GlobalVariableGet(gvPrefix + "pauseUntil");
+
+   // Delete GVs after restoring (one-time use)
+   GlobalVariableDel(gvPrefix + "dayNetProfit");
+   GlobalVariableDel(gvPrefix + "lastDayOfYear");
+   GlobalVariableDel(gvPrefix + "dailyTargetReached");
+   GlobalVariableDel(gvPrefix + "dailyLossLimitReached");
+   GlobalVariableDel(gvPrefix + "currentDirection");
+   GlobalVariableDel(gvPrefix + "pauseUntil");
+
+   Print("Daily values RESTORED from GlobalVariables:",
+         " | dayNetProfit=$", DoubleToString(dayNetProfit, 2),
+         " | targetReached=", dailyTargetReachedToday,
+         " | lossLimitReached=", dailyLossLimitReachedToday,
+         " | direction=", (currentDirection == 0) ? "BUY" : "SELL");
+
+   return true;
+}
 
 //+------------------------------------------------------------------+
 //| EXPERT INITIALIZATION                                            |
@@ -96,17 +168,27 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(Slippage);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   trade.SetTypeFillingBySymbol(_Symbol);  // Auto-detect fill type for broker compatibility
 
-   // Initialize day tracking
-   MqlDateTime dt;
-   TimeCurrent(dt);
-   lastDayOfYear = dt.day_of_year;
-   dayNetProfit = 0.0;
+   // Try to restore daily values (from input change)
+   bool restored = RestoreDailyValuesFromGV();
 
-   // Set initial direction if not set
-   if(currentDirection == -1)
-      currentDirection = 0;  // Start with BUY
+   if(!restored)
+   {
+      // Fresh start - initialize day tracking
+      MqlDateTime dt;
+      TimeCurrent(dt);
+      lastDayOfYear = dt.day_of_year;
+      dayNetProfit = 0.0;
+      dailyTargetReachedToday = false;
+      dailyLossLimitReachedToday = false;
+
+      // Set initial direction if not set
+      if(currentDirection == -1)
+         currentDirection = 0;  // Start with BUY
+
+      Print("B10 Fresh Start: Day tracking initialized");
+   }
 
    Print("B10 Initialized: Dynamic SL=$", MinStopLoss, "-$", MaxStopLoss,
          " | Daily Target=$", DailyTarget, " | Daily Loss Limit=$", DailyLossLimit);
@@ -119,6 +201,18 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // Save daily values ONLY when inputs are changed (not on full restart)
+   // REASON_PARAMETERS = 5 (input parameters changed)
+   if(reason == REASON_PARAMETERS)
+   {
+      SaveDailyValuesToGV();
+      Print("OnDeinit: Input parameters changed - daily values saved");
+   }
+   else
+   {
+      Print("OnDeinit: Reason=", reason, " - fresh start on next init");
+   }
+
    Comment("");
 }
 
@@ -133,10 +227,16 @@ void CheckDayReset()
    if(dt.day_of_year != lastDayOfYear)
    {
       // New day - reset counters
-      Print("NEW DAY RESET: Previous dayNetProfit=$", dayNetProfit);
+      Print("NEW DAY RESET: Previous dayNetProfit=$", dayNetProfit,
+            " | Target Reached: ", dailyTargetReachedToday,
+            " | Loss Limit Reached: ", dailyLossLimitReachedToday);
+
       dayNetProfit = 0.0;
+      dailyTargetReachedToday = false;
+      dailyLossLimitReachedToday = false;
       lastDayOfYear = dt.day_of_year;
-      Print("Day counters reset. New day started.");
+
+      Print("Day counters and flags reset. New day started.");
    }
 }
 
@@ -259,7 +359,20 @@ bool IsInMarketPauseBuffer()
 //+------------------------------------------------------------------+
 bool IsDailyTargetReached()
 {
-   return (dayNetProfit >= DailyTarget);
+   // If flag is already set, stay stopped (even if inputs change)
+   if(dailyTargetReachedToday)
+      return true;
+
+   // Check if target reached now
+   if(dayNetProfit >= DailyTarget)
+   {
+      dailyTargetReachedToday = true;  // Lock it for the rest of the day
+      Print("DAILY TARGET REACHED: $", DoubleToString(dayNetProfit, 2),
+            " >= $", DoubleToString(DailyTarget, 2), " - Trading stopped for today");
+      return true;
+   }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -267,7 +380,20 @@ bool IsDailyTargetReached()
 //+------------------------------------------------------------------+
 bool IsDailyLossLimitReached()
 {
-   return (dayNetProfit <= -DailyLossLimit);
+   // If flag is already set, stay stopped (even if inputs change)
+   if(dailyLossLimitReachedToday)
+      return true;
+
+   // Check if loss limit reached now
+   if(dayNetProfit <= -DailyLossLimit)
+   {
+      dailyLossLimitReachedToday = true;  // Lock it for the rest of the day
+      Print("DAILY LOSS LIMIT REACHED: $", DoubleToString(dayNetProfit, 2),
+            " <= -$", DoubleToString(DailyLossLimit, 2), " - Trading stopped for today");
+      return true;
+   }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -299,22 +425,10 @@ bool CanOpenNewTrades()
 }
 
 //+------------------------------------------------------------------+
-//| SPREAD CHECK                                                     |
-//+------------------------------------------------------------------+
-bool SpreadOK()
-{
-   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   return (spread <= MaxSpread);
-}
-
-//+------------------------------------------------------------------+
 //| ALLOW TRADING                                                    |
 //+------------------------------------------------------------------+
 bool AllowTrading()
 {
-   if(!SpreadOK())
-      return false;
-
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
       return false;
 
@@ -517,9 +631,28 @@ void ProcessCloseAll()
 
    if(TotalOurPositions() == 0)
    {
-      // Record the realized profit/loss
-      // Note: This will be captured from the last trade profit
-      // For accurate tracking, we get the profit before closing
+      // Calculate ACTUAL realized P/L using balance difference
+      // Only calculate if balanceBeforeClose was properly set (not 0)
+      if(balanceBeforeClose > 0)
+      {
+         double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+         double realizedProfit = currentBalance - balanceBeforeClose;
+
+         // Update day profit with ACTUAL realized amount (not floating)
+         dayNetProfit += realizedProfit;
+
+         Print("REALIZED P/L: $", DoubleToString(realizedProfit, 2),
+               " | Balance Before: $", DoubleToString(balanceBeforeClose, 2),
+               " | Balance After: $", DoubleToString(currentBalance, 2),
+               " | Day Net Profit: $", DoubleToString(dayNetProfit, 2));
+
+         // Reset balance tracker
+         balanceBeforeClose = 0.0;
+      }
+      else
+      {
+         Print("WARNING: balanceBeforeClose not set, skipping day profit update");
+      }
 
       // Switch direction (ALWAYS)
       SwitchDirection();
@@ -580,7 +713,6 @@ void OpenFirstTrade()
 
    if(result)
    {
-      lastTradeTime = TimeCurrent();
       Print("FIRST TRADE OPENED: ", (currentDirection == 0) ? "BUY" : "SELL",
             " | Dynamic SL: $", GetDynamicStopLoss());
    }
@@ -615,10 +747,7 @@ void ManageGrid()
 
       if(distance >= requiredDistance)
       {
-         bool result = trade.Buy(NormalizeLot(LotSize), _Symbol, ask, 0, 0, "B10_GridBuy");
-
-         if(result)
-            lastTradeTime = TimeCurrent();
+         trade.Buy(NormalizeLot(LotSize), _Symbol, ask, 0, 0, "B10_GridBuy");
       }
    }
    else  // SELL GRID
@@ -633,10 +762,7 @@ void ManageGrid()
 
       if(distance >= requiredDistance)
       {
-         bool result = trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "B10_GridSell");
-
-         if(result)
-            lastTradeTime = TimeCurrent();
+         trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "B10_GridSell");
       }
    }
 }
@@ -755,10 +881,8 @@ void OnTick()
                " | Dynamic SL=$", currentStopLoss,
                " | Day Profit Before=$", dayNetProfit);
 
-         // Update day profit with this loss
-         dayNetProfit += gridProfit;
-
-         Print("Day Profit After Stop Loss: $", dayNetProfit);
+         // Store balance BEFORE closing to calculate realized P/L later
+         balanceBeforeClose = AccountInfoDouble(ACCOUNT_BALANCE);
 
          RequestCloseAll(true, currentStopLoss);
          Dashboard();
@@ -777,10 +901,8 @@ void OnTick()
                   " | Trail Level=$", trailLevel,
                   " | Day Profit Before=$", dayNetProfit);
 
-            // Update day profit with this profit
-            dayNetProfit += gridProfit;
-
-            Print("Day Profit After Trail Stop: $", dayNetProfit);
+            // Store balance BEFORE closing to calculate realized P/L later
+            balanceBeforeClose = AccountInfoDouble(ACCOUNT_BALANCE);
 
             RequestCloseAll(false);
             Dashboard();
@@ -800,10 +922,6 @@ void OnTick()
    // STEP 2: No positions - check if we can open new trade
    if(totalPositions == 0)
    {
-      // Reset peak profit for new cycle
-      if(gridPeakProfit > 0)
-         gridPeakProfit = 0.0;
-
       // Check if we can open new trades
       if(CanOpenNewTrades() && AllowTrading())
       {
