@@ -658,6 +658,11 @@ void ProcessCloseAll()
 
    if(TotalOurPositions() == 0)
    {
+      // IMPORTANT: Save closeAfterLoss and lastStopLossAmount BEFORE ResetEngine()
+      // because ResetEngine() clears closeAfterLoss, which would break pause logic
+      bool wasLossClose = closeAfterLoss;
+      double lossAmount = lastStopLossAmount;
+
       // Calculate ACTUAL realized P/L using balance difference
       // Only calculate if balanceBeforeClose was properly set (not 0)
       if(balanceBeforeClose > 0)
@@ -684,22 +689,25 @@ void ProcessCloseAll()
       // Switch direction (ALWAYS)
       SwitchDirection();
 
+      // Reset engine state (clears gridPeakProfit, closeAllPending, closeAfterLoss)
       ResetEngine();
 
-      if(closeAfterLoss && lastStopLossAmount > 0)
+      // Apply pause logic using SAVED values (before ResetEngine cleared them)
+      if(wasLossClose && lossAmount > 0)
       {
          // Apply dynamic pause based on stop loss amount
-         int pauseMinutes = GetPauseDurationMinutes(lastStopLossAmount);
+         int pauseMinutes = GetPauseDurationMinutes(lossAmount);
 
          if(pauseMinutes > 0)
          {
             pauseUntil = TimeCurrent() + (pauseMinutes * 60);
-            Print("PAUSE ACTIVATED: ", pauseMinutes, " minutes due to stop loss of $", lastStopLossAmount);
+            Print("PAUSE ACTIVATED: ", pauseMinutes, " minutes due to stop loss of $",
+                  DoubleToString(lossAmount, 2));
          }
          else
          {
             pauseUntil = 0;
-            Print("NO PAUSE: Stop loss $", lastStopLossAmount, " < $150");
+            Print("NO PAUSE: Stop loss $", DoubleToString(lossAmount, 2), " < $150");
          }
       }
       else
@@ -707,6 +715,7 @@ void ProcessCloseAll()
          pauseUntil = 0;
       }
 
+      // Clear remaining close state (some already cleared by ResetEngine)
       closeAllPending = false;
       closeAfterLoss = false;
       lastStopLossAmount = 0.0;
