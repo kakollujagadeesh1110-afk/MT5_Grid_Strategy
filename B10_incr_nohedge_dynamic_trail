@@ -299,14 +299,16 @@ double GetDynamicStopLoss()
 //+------------------------------------------------------------------+
 int GetPauseDurationMinutes(double stopLossAmount)
 {
-   if(stopLossAmount < 150.0)
-      return 0;   // No pause
+   if(stopLossAmount < 75.0)
+      return 0;   // No pause (edge case - below minimum SL)
+   else if(stopLossAmount < 150.0)
+      return 5;   // 5 minutes ($75-$149)
    else if(stopLossAmount < 200.0)
-      return 30;  // 30 minutes
+      return 30;  // 30 minutes ($150-$199)
    else if(stopLossAmount < 250.0)
-      return 45;  // 45 minutes
+      return 45;  // 45 minutes ($200-$249)
    else
-      return 60;  // 60 minutes (250-300)
+      return 60;  // 60 minutes ($250-$300)
 }
 
 //+------------------------------------------------------------------+
