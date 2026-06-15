@@ -2,26 +2,29 @@
 
 ## Overview
 
-This folder contains **17 Expert Advisor (EA) variations** for MetaTrader 5, designed for XAUUSD (Gold) trading using grid strategies with optional hedging features.
+This folder contains **18 Expert Advisor (EA) variations** for MetaTrader 5, designed for XAUUSD (Gold) trading using grid strategies and EMA-based strategies.
 
 ---
 
 ## File Naming Convention
 
-Each file follows the pattern: `{Series}{Number}_{grid-type}_{hedge}_{pooling}_{trailing}.mq5`
+Each file follows the pattern: `{Series}{Number}_{strategy-type}_{features}.mq5`
 
 | Component | Meaning |
 |-----------|---------|
 | **A** | Fixed Grid Distance (200 points always) |
 | **B** | Incremental Grid Distance (200 × N pattern) |
+| **C** | EMA-based Single Trade strategies |
 | **1-2** | No Hedge strategies |
 | **3-7** | With Hedge strategies |
 | **8-9** | Time-filtered versions (trades only during optimal hours) |
+| **10** | Dynamic stop loss + daily limits |
 | **nohedge/hedge** | Hedge protection enabled or not |
 | **nopool/pool** | Profit pooling (tracks hedge profits) |
 | **notrail/trail** | Grid trailing stop enabled or not |
 | **dual_trail** | Both hedge profit and hedge loss trailing enabled |
 | **time** | Time filter enabled (MT5 broker time, auto DST handling) |
+| **ema** | EMA-based entry signal |
 
 ---
 
@@ -47,7 +50,15 @@ Each file follows the pattern: `{Series}{Number}_{grid-type}_{hedge}_{pooling}_{
 | **B9_incr_hedge_pool_trail_time** | **Incremental** | **Yes** | **Yes** | **Yes** | **Yes** | **No** |
 | **B10_incr_nohedge_dynamic_trail** | **Incremental** | **No** | **N/A** | **Yes** | **N/A** | **N/A** |
 
+### C-Series: EMA-Based Strategies
+
+| File | Strategy | Entry Signal | Hedge | Trailing | Stop Loss |
+|------|----------|--------------|-------|----------|-----------|
+| **C1_ema_single_trade** | Single Trade | 1H Open vs 50-day EMA | No | Yes | 60% of investment |
+
 **NEW (V8):** B10 includes **dynamic stop loss**, **daily limits**, and **24/7 trading** - see section below.
+
+**NEW (V8):** C1 is an **EMA-based single trade strategy** - see section below.
 
 **B8 and B9:** Include **consistent dual trading windows** with comprehensive filters:
 
@@ -1251,6 +1262,7 @@ During March and November, there are brief periods when one market has switched 
 | Most sophisticated | **B9** (incr + hedge + pool + trail + time) |
 | Simplest with time filter | **B8** (incr + trail + time) |
 | **24/7 with dynamic features** | **B10** (incr + dynamic SL + daily limits) |
+| **EMA-based single trade** | **C1** (single lot + EMA signal + trailing) |
 
 ---
 
@@ -1298,9 +1310,10 @@ Different pause durations based on stop loss amount hit:
 
 | Stop Loss Hit | Pause Duration | Reason |
 |---------------|----------------|--------|
-| < $150 | 0 minutes | Small loss, continue immediately |
-| $150 - $199 | 30 minutes | Moderate loss, brief cooldown |
-| $200 - $249 | 45 minutes | Significant loss, longer cooldown |
+| < $75 | 0 minutes | Edge case - below minimum SL |
+| $75 - $149 | 5 minutes | Small loss, brief cooldown |
+| $150 - $199 | 30 minutes | Moderate loss, longer cooldown |
+| $200 - $249 | 45 minutes | Significant loss, extended cooldown |
 | $250 - $300 | 60 minutes | Large loss, full hour reset |
 
 **Direction always switches** regardless of pause duration.
@@ -1419,6 +1432,108 @@ Tuesday 01:00:
 
 ---
 
+## C1: EMA Single Trade Strategy (NEW in V8)
+
+### Overview
+
+C1 is a simple **single lot, single trade strategy** based on EMA crossover signals:
+
+| Feature | Description |
+|---------|-------------|
+| Strategy Type | Single Trade (one position at a time) |
+| Entry Signal | 1H candle open vs 50-day EMA |
+| Position Size | Single lot (configurable) |
+| Stop Loss | 60% of investment (configurable) |
+| Profit Exit | Trailing Stop Only |
+| Auto Close | Before market close |
+
+### Entry Logic
+
+The strategy checks the 1-hour candle open price against the 50-day EMA:
+
+```
+IF 1H candle open BELOW 50-day EMA:
+   → Open SELL position
+
+IF 1H candle open ABOVE 50-day EMA:
+   → Open BUY position
+```
+
+**One trade per day** - once a trade is opened, no new trades until the next day.
+
+### Exit Conditions
+
+1. **Stop Loss**: Closes if loss exceeds 60% of investment
+   - Investment = Lot Size × Contract Size × Open Price
+   - Example: 0.01 lot at $2000 = ~$2000 investment → SL at ~$1200 loss
+
+2. **Trailing Stop**: Locks in profits
+   - Activates when profit reaches TrailStart (default $20)
+   - Closes if profit drops TrailStep (default $10) from peak
+
+3. **Market Close**: Auto-closes position before market close
+   - Default: 5 minutes before 00:00 UTC+3
+   - Configurable via `CloseMinutesBeforeMarketClose`
+
+### C1 Input Parameters
+
+```cpp
+//--- TRADE SETTINGS ---
+input double LotSize                      = 0.01;
+input int    EMAPeriod                    = 50;       // EMA Period (days)
+input double StopLossPercent              = 60.0;     // Stop Loss % of investment
+
+//--- TRAILING STOP ---
+input double TrailStart                   = 20.0;     // Start trailing at this profit ($)
+input double TrailStep                    = 10.0;     // Trail by this amount ($)
+
+//--- CLOSE BEFORE MARKET CLOSE ---
+input int    CloseMinutesBeforeMarketClose = 5;       // Minutes before market close
+
+//--- SAFETY ---
+input ulong  MagicNumber                  = 201010;
+input ulong  Slippage                     = 30;
+```
+
+### C1 Example Trading Day
+
+```
+Day starts: Monday 01:00 UTC+3
+50-day EMA = $2010.00
+
+09:00 - New 1H candle opens at $2005.00
+├── 1H Open ($2005) < EMA ($2010)
+├── Signal: SELL
+└── Opens SELL position at $2005.00
+
+12:00 - Price drops to $2000.00
+├── Position profit: +$50
+├── Peak profit: $50
+├── Trail activated (profit > $20)
+└── Trail level: $50 - $10 = $40
+
+14:00 - Price rises to $2002.00
+├── Position profit: +$30
+├── Profit ($30) < Trail level ($40)
+└── TRAILING STOP triggered - Close with $30 profit
+
+Result: +$30 profit
+Next day: Ready for new trade based on EMA signal
+```
+
+### When to Use C1
+
+**Best For:**
+- Traders who prefer simple, trend-following strategies
+- Those who want limited exposure (one trade per day)
+- Markets with clear directional trends
+
+**Not Ideal For:**
+- Ranging/choppy markets (EMA signals may whipsaw)
+- Traders wanting multiple trades per day
+
+---
+
 ## Changelog
 
 - **v1**: Original grid + hedge strategy
@@ -1482,8 +1597,9 @@ Tuesday 01:00:
     - **Dynamic Stop Loss**: Adjusts from $75-$300 based on day profit
       - If dayProfit <= $85: Use minimum $75
       - If dayProfit > $85: Use (dayProfit - $10), capped at $300
-    - **Dynamic Pause After Stop Loss**: 0/30/45/60 minutes based on loss size
-      - < $150: No pause
+    - **Dynamic Pause After Stop Loss**: 0/5/30/45/60 minutes based on loss size
+      - < $75: No pause (edge case)
+      - $75-$149: 5 minutes
       - $150-$199: 30 minutes
       - $200-$249: 45 minutes
       - $250-$300: 60 minutes
@@ -1498,7 +1614,15 @@ Tuesday 01:00:
     - **Daily Flags Persistence**: Daily target/loss limit flags now persist through input changes (only reset on new day or full EA restart)
     - **Broker Compatibility**: Changed from hardcoded `ORDER_FILLING_IOC` to `SetTypeFillingBySymbol()` for auto-detection
     - **Removed MaxSpread**: Unnecessary copy-paste from other strategies (market pause buffers already handle high-spread periods)
-  - 17 total strategy variations available
+    - **Pause Logic Fix**: Fixed bug where pause after stop loss never triggered (saved values before ResetEngine cleared them)
+    - **Updated Pause Durations**: Added 5-minute pause for $75-$149 stop loss (was 0 minutes)
+  - **C1**: NEW EMA-based single trade strategy
+    - Single lot, single trade per day
+    - Entry: 1H candle open vs 50-day EMA (below=SELL, above=BUY)
+    - Stop loss: 60% of investment (configurable)
+    - Profit exit: Trailing stop only
+    - Auto-close before market close
+  - 18 total strategy variations available
 
 ---
 
