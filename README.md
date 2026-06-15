@@ -1377,6 +1377,12 @@ input double DynamicSLThreshold           = 85.0;   // Day profit threshold ($)
 input double DailyTarget                  = 200.0;  // Stop when reached ($)
 input double DailyLossLimit               = 500.0;  // Stop when loss reaches this ($)
 
+//--- DYNAMIC DAILY TARGET (based on loss) ---
+input double LossThreshold1               = 200.0;  // When day loss >= this, reduce target
+input double ReducedTarget1               = 50.0;   // New target after LossThreshold1
+input double LossThreshold2               = 300.0;  // When day loss >= this, reduce further
+input double ReducedTarget2               = 10.0;   // New target after LossThreshold2
+
 //--- MARKET PAUSE BUFFERS ---
 input int    PauseMinutesAfterMarketOpen  = 0;      // Minutes after 01:00
 input int    PauseMinutesBeforeMarketClose = 0;     // Minutes before 00:00
@@ -1387,6 +1393,43 @@ input ulong  Slippage                     = 30;     // Max price deviation in po
 ```
 
 **Note:** B10 uses `SetTypeFillingBySymbol()` for automatic broker compatibility (no hardcoded fill type).
+
+#### 7. Dynamic Daily Target (Based on Loss)
+
+When the day's cumulative loss reaches certain thresholds, the daily target is automatically reduced:
+
+| Day Net Profit | Daily Target Applied |
+|----------------|---------------------|
+| >= -$199 | Original ($200 default) |
+| <= -$200 | Reduced to $50 (Level 1) |
+| <= -$300 | Reduced to $10 (Level 2) |
+
+**Important Rules:**
+- Once a threshold is hit, the reduced target stays for the rest of the day
+- Even if profit recovers (e.g., from -$250 to -$100), the target remains reduced
+- Level 2 takes precedence over Level 1
+- Flags reset at midnight (00:00 UTC+3)
+
+**Example Scenario:**
+```
+Day starts: DailyTarget = $200
+
+Trade 1: -$75 stop loss → dayNetProfit = -$75 → Target still $200
+Trade 2: +$40 profit → dayNetProfit = -$35 → Target still $200
+Trade 3: -$75 stop loss → dayNetProfit = -$110 → Target still $200
+Trade 4: -$150 stop loss → dayNetProfit = -$260 → LEVEL 1 HIT → Target now $50
+
+(If profit recovers to -$100, target REMAINS $50)
+
+Trade 5: -$75 stop loss → dayNetProfit = -$335 → LEVEL 2 HIT → Target now $10
+
+(Even if profit recovers to +$50, target REMAINS $10 for rest of day)
+```
+
+**Why This Matters:**
+- After significant losses, it's harder to recover to original target
+- Reduced target allows earlier exit to preserve remaining capital
+- Prevents "revenge trading" by setting achievable goals after losses
 
 ### B10 Example Trading Day
 
@@ -1616,9 +1659,14 @@ Next day: Ready for new trade based on EMA signal
     - **Removed MaxSpread**: Unnecessary copy-paste from other strategies (market pause buffers already handle high-spread periods)
     - **Pause Logic Fix**: Fixed bug where pause after stop loss never triggered (saved values before ResetEngine cleared them)
     - **Updated Pause Durations**: Added 5-minute pause for $75-$149 stop loss (was 0 minutes)
+  - **NEW FEATURE (B10)**: Dynamic Daily Target based on loss thresholds
+    - When day loss >= $200 → Daily target reduced to $50
+    - When day loss >= $300 → Daily target reduced to $10
+    - Once reduced, target stays reduced for rest of day (even if profit recovers)
+    - Configurable thresholds via inputs: LossThreshold1/2, ReducedTarget1/2
   - **C1**: NEW EMA-based single trade strategy
     - Single lot, single trade per day
-    - Entry: 1H candle open vs 50-day EMA (below=SELL, above=BUY)
+    - Entry: 1H candle open vs 50-day EMA (above=BUY, below=SELL)
     - Stop loss: 60% of investment (configurable)
     - Profit exit: Trailing stop only
     - Auto-close before market close
