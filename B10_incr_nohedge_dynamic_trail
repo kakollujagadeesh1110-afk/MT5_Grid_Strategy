@@ -54,6 +54,13 @@ input double DynamicSLThreshold           = 85.0;   // Day profit threshold for 
 input double DailyTarget                  = 200.0;  // Stop trading when day profit reaches this ($)
 input double DailyLossLimit               = 500.0;  // Stop trading when day loss reaches this ($)
 
+//---------------- DYNAMIC DAILY TARGET (based on loss) ----------------//
+
+input double LossThreshold1               = 200.0;  // When day loss reaches this, reduce target
+input double ReducedTarget1               = 50.0;   // New target after LossThreshold1 hit
+input double LossThreshold2               = 300.0;  // When day loss reaches this, reduce target further
+input double ReducedTarget2               = 10.0;   // New target after LossThreshold2 hit
+
 //---------------- MARKET PAUSE BUFFERS ----------------//
 
 input int    PauseMinutesAfterMarketOpen  = 0;      // Minutes to pause after market open (01:00)
@@ -80,6 +87,10 @@ int lastDayOfYear = -1;
 bool dailyTargetReachedToday = false;   // Persists even if inputs change
 bool dailyLossLimitReachedToday = false; // Persists even if inputs change
 
+// Dynamic daily target tracking (based on loss thresholds)
+bool targetReducedToLevel1 = false;  // True if day loss hit LossThreshold1 (-$200)
+bool targetReducedToLevel2 = false;  // True if day loss hit LossThreshold2 (-$300)
+
 // GlobalVariable names for persistence through input changes
 string gvPrefix = "B10_";  // Prefix for GlobalVariables
 
@@ -103,6 +114,8 @@ void SaveDailyValuesToGV()
    GlobalVariableSet(gvPrefix + "dailyLossLimitReached", dailyLossLimitReachedToday ? 1.0 : 0.0);
    GlobalVariableSet(gvPrefix + "currentDirection", (double)currentDirection);
    GlobalVariableSet(gvPrefix + "pauseUntil", (double)pauseUntil);
+   GlobalVariableSet(gvPrefix + "targetReducedLevel1", targetReducedToLevel1 ? 1.0 : 0.0);
+   GlobalVariableSet(gvPrefix + "targetReducedLevel2", targetReducedToLevel2 ? 1.0 : 0.0);
 
    Print("Daily values SAVED to GlobalVariables for input change persistence");
 }
@@ -133,6 +146,8 @@ bool RestoreDailyValuesFromGV()
       GlobalVariableDel(gvPrefix + "dailyLossLimitReached");
       GlobalVariableDel(gvPrefix + "currentDirection");
       GlobalVariableDel(gvPrefix + "pauseUntil");
+      GlobalVariableDel(gvPrefix + "targetReducedLevel1");
+      GlobalVariableDel(gvPrefix + "targetReducedLevel2");
       return false;
    }
 
@@ -143,6 +158,8 @@ bool RestoreDailyValuesFromGV()
    dailyLossLimitReachedToday = (GlobalVariableGet(gvPrefix + "dailyLossLimitReached") == 1.0);
    currentDirection = (int)GlobalVariableGet(gvPrefix + "currentDirection");
    pauseUntil = (datetime)GlobalVariableGet(gvPrefix + "pauseUntil");
+   targetReducedToLevel1 = (GlobalVariableGet(gvPrefix + "targetReducedLevel1") == 1.0);
+   targetReducedToLevel2 = (GlobalVariableGet(gvPrefix + "targetReducedLevel2") == 1.0);
 
    // Delete GVs after restoring (one-time use)
    GlobalVariableDel(gvPrefix + "dayNetProfit");
@@ -151,11 +168,15 @@ bool RestoreDailyValuesFromGV()
    GlobalVariableDel(gvPrefix + "dailyLossLimitReached");
    GlobalVariableDel(gvPrefix + "currentDirection");
    GlobalVariableDel(gvPrefix + "pauseUntil");
+   GlobalVariableDel(gvPrefix + "targetReducedLevel1");
+   GlobalVariableDel(gvPrefix + "targetReducedLevel2");
 
    Print("Daily values RESTORED from GlobalVariables:",
          " | dayNetProfit=$", DoubleToString(dayNetProfit, 2),
          " | targetReached=", dailyTargetReachedToday,
          " | lossLimitReached=", dailyLossLimitReachedToday,
+         " | targetLevel1=", targetReducedToLevel1,
+         " | targetLevel2=", targetReducedToLevel2,
          " | direction=", (currentDirection == 0) ? "BUY" : "SELL");
 
    return true;
@@ -254,13 +275,17 @@ void CheckDayReset()
    if(dt.day_of_year != lastDayOfYear)
    {
       // New day - reset counters
-      Print("NEW DAY RESET: Previous dayNetProfit=$", dayNetProfit,
+      Print("NEW DAY RESET: Previous dayNetProfit=$", DoubleToString(dayNetProfit, 2),
             " | Target Reached: ", dailyTargetReachedToday,
-            " | Loss Limit Reached: ", dailyLossLimitReachedToday);
+            " | Loss Limit Reached: ", dailyLossLimitReachedToday,
+            " | Target Level1: ", targetReducedToLevel1,
+            " | Target Level2: ", targetReducedToLevel2);
 
       dayNetProfit = 0.0;
       dailyTargetReachedToday = false;
       dailyLossLimitReachedToday = false;
+      targetReducedToLevel1 = false;
+      targetReducedToLevel2 = false;
       lastDayOfYear = dt.day_of_year;
 
       Print("Day counters and flags reset. New day started.");
@@ -292,6 +317,50 @@ double GetDynamicStopLoss()
    }
 
    return stopLoss;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK AND UPDATE LOSS THRESHOLD FLAGS                            |
+//| Once a threshold is hit, the flag stays true for the rest of day |
+//+------------------------------------------------------------------+
+void CheckLossThresholds()
+{
+   // Check Level 2 first (higher priority - more severe loss)
+   // Once Level 2 is hit, it stays - even if profit recovers
+   if(!targetReducedToLevel2 && dayNetProfit <= -LossThreshold2)
+   {
+      targetReducedToLevel2 = true;
+      targetReducedToLevel1 = true;  // Level 1 is also true if Level 2 is hit
+      Print("LOSS THRESHOLD 2 HIT: Day Loss=$", DoubleToString(-dayNetProfit, 2),
+            " >= $", DoubleToString(LossThreshold2, 2),
+            " | Daily Target reduced to $", DoubleToString(ReducedTarget2, 2));
+   }
+   // Check Level 1 (only if Level 2 not already hit)
+   else if(!targetReducedToLevel1 && dayNetProfit <= -LossThreshold1)
+   {
+      targetReducedToLevel1 = true;
+      Print("LOSS THRESHOLD 1 HIT: Day Loss=$", DoubleToString(-dayNetProfit, 2),
+            " >= $", DoubleToString(LossThreshold1, 2),
+            " | Daily Target reduced to $", DoubleToString(ReducedTarget1, 2));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| GET EFFECTIVE DAILY TARGET                                       |
+//| Returns the current daily target based on loss threshold flags   |
+//+------------------------------------------------------------------+
+double GetEffectiveDailyTarget()
+{
+   // Level 2 has highest priority (most severe reduction)
+   if(targetReducedToLevel2)
+      return ReducedTarget2;
+
+   // Level 1 next
+   if(targetReducedToLevel1)
+      return ReducedTarget1;
+
+   // No reduction - use input value
+   return DailyTarget;
 }
 
 //+------------------------------------------------------------------+
@@ -392,12 +461,17 @@ bool IsDailyTargetReached()
    if(dailyTargetReachedToday)
       return true;
 
+   // Get the effective target (may be reduced due to loss thresholds)
+   double effectiveTarget = GetEffectiveDailyTarget();
+
    // Check if target reached now
-   if(dayNetProfit >= DailyTarget)
+   if(dayNetProfit >= effectiveTarget)
    {
       dailyTargetReachedToday = true;  // Lock it for the rest of the day
       Print("DAILY TARGET REACHED: $", DoubleToString(dayNetProfit, 2),
-            " >= $", DoubleToString(DailyTarget, 2), " - Trading stopped for today");
+            " >= $", DoubleToString(effectiveTarget, 2),
+            " (Original: $", DoubleToString(DailyTarget, 2), ")",
+            " - Trading stopped for today");
       return true;
    }
 
@@ -812,6 +886,7 @@ void Dashboard()
 {
    double gridProfit = GetGridProfit();
    double currentStopLoss = GetDynamicStopLoss();
+   double effectiveTarget = GetEffectiveDailyTarget();
    int gridCount = TotalOurPositions();
 
    string pauseStatus = "NO";
@@ -826,6 +901,13 @@ void Dashboard()
    string bufferStatus = IsInMarketPauseBuffer() ? "YES" : "NO";
    string dailyTargetStatus = IsDailyTargetReached() ? "REACHED!" : "Active";
    string dailyLossStatus = IsDailyLossLimitReached() ? "REACHED!" : "Active";
+
+   // Target reduction status
+   string targetReductionStatus = "Normal";
+   if(targetReducedToLevel2)
+      targetReductionStatus = "LEVEL 2 (Loss >= $" + DoubleToString(LossThreshold2, 0) + ")";
+   else if(targetReducedToLevel1)
+      targetReductionStatus = "LEVEL 1 (Loss >= $" + DoubleToString(LossThreshold1, 0) + ")";
 
    string trailStatus = "Waiting";
    double trailLevel = 0;
@@ -860,8 +942,16 @@ void Dashboard()
       "\nSL Threshold: $", DoubleToString(DynamicSLThreshold, 2),
 
       "\n\n--- DAILY LIMITS ---",
-      "\nDaily Target: $", DoubleToString(DailyTarget, 2), " (", dailyTargetStatus, ")",
+      "\nOriginal Target: $", DoubleToString(DailyTarget, 2),
+      "\nEffective Target: $", DoubleToString(effectiveTarget, 2), " (", dailyTargetStatus, ")",
+      "\nTarget Reduction: ", targetReductionStatus,
       "\nDaily Loss Limit: $", DoubleToString(DailyLossLimit, 2), " (", dailyLossStatus, ")",
+
+      "\n\n--- LOSS THRESHOLDS ---",
+      "\nThreshold 1: -$", DoubleToString(LossThreshold1, 0), " -> Target $", DoubleToString(ReducedTarget1, 0),
+      (targetReducedToLevel1 ? " [HIT]" : ""),
+      "\nThreshold 2: -$", DoubleToString(LossThreshold2, 0), " -> Target $", DoubleToString(ReducedTarget2, 0),
+      (targetReducedToLevel2 ? " [HIT]" : ""),
 
       "\n\n--- PAUSE STATUS ---",
       "\nDynamic Pause: ", pauseStatus,
@@ -881,6 +971,9 @@ void OnTick()
 {
    // Check for new day and reset counters
    CheckDayReset();
+
+   // Check and update loss threshold flags (affects daily target)
+   CheckLossThresholds();
 
    // Handle pending close operations
    if(closeAllPending)
