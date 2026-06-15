@@ -215,6 +215,8 @@ int OnInit()
          dayNetProfit = 0.0;
          dailyTargetReachedToday = false;
          dailyLossLimitReachedToday = false;
+         targetReducedToLevel1 = false;
+         targetReducedToLevel2 = false;
 
          Print("B10 Fresh Start: Day tracking initialized");
       }
@@ -783,7 +785,7 @@ void ProcessCloseAll()
          else
          {
             pauseUntil = 0;
-            Print("NO PAUSE: Stop loss $", DoubleToString(lossAmount, 2), " < $150");
+            Print("NO PAUSE: Stop loss $", DoubleToString(lossAmount, 2), " < $75");
          }
       }
       else
