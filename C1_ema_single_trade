@@ -361,17 +361,28 @@ void OpenTrade()
    bool result = false;
    string direction = "";
 
-   if(h1Open < emaValue)
+   // Log values for debugging
+   Print("EMA Check: H1 Open=", DoubleToString(h1Open, 2),
+         " | 50-Day EMA=", DoubleToString(emaValue, 2),
+         " | Difference=", DoubleToString(h1Open - emaValue, 2));
+
+   // TREND-FOLLOWING LOGIC:
+   // - Price ABOVE EMA (bullish trend) → BUY
+   // - Price BELOW EMA (bearish trend) → SELL
+
+   if(h1Open > emaValue)
    {
-      // 1H candle open BELOW EMA → SELL
-      result = trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "C1_EMA_Sell");
-      direction = "SELL";
-   }
-   else if(h1Open > emaValue)
-   {
-      // 1H candle open ABOVE EMA → BUY
+      // 1H candle open ABOVE EMA → BUY (bullish)
       result = trade.Buy(NormalizeLot(LotSize), _Symbol, ask, 0, 0, "C1_EMA_Buy");
       direction = "BUY";
+      Print("Signal: H1 Open (", DoubleToString(h1Open, 2), ") > EMA (", DoubleToString(emaValue, 2), ") → BUY");
+   }
+   else if(h1Open < emaValue)
+   {
+      // 1H candle open BELOW EMA → SELL (bearish)
+      result = trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "C1_EMA_Sell");
+      direction = "SELL";
+      Print("Signal: H1 Open (", DoubleToString(h1Open, 2), ") < EMA (", DoubleToString(emaValue, 2), ") → SELL");
    }
    else
    {
@@ -470,10 +481,10 @@ void Dashboard()
    string signal = "NONE";
    if(emaValue > 0)
    {
-      if(h1Open < emaValue)
-         signal = "SELL (H1 Open < EMA)";
-      else if(h1Open > emaValue)
+      if(h1Open > emaValue)
          signal = "BUY (H1 Open > EMA)";
+      else if(h1Open < emaValue)
+         signal = "SELL (H1 Open < EMA)";
    }
 
    string trailStatus = "Waiting";
