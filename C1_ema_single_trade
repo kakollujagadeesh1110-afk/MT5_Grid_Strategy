@@ -1,0 +1,556 @@
+//+------------------------------------------------------------------+
+//|                                         C1_ema_single_trade.mq5  |
+//|                                                                  |
+//|  STRATEGY: Single Lot EMA Crossover with Trailing Stop           |
+//|                                                                  |
+//|  FEATURES:                                                       |
+//|  - Single lot, single trade at a time                            |
+//|  - Entry based on 1H candle open vs 50-day EMA                   |
+//|  - If 1H open BELOW EMA → SELL                                   |
+//|  - If 1H open ABOVE EMA → BUY                                    |
+//|  - Stop loss at 60% of investment                                |
+//|  - Trailing stop loss for profit locking                         |
+//|  - Auto-close before market close                                |
+//|                                                                  |
+//|  XAUUSD MARKET HOURS (UTC+3):                                    |
+//|  - Daily: 01:00 to 00:00 (23 hours)                              |
+//|  - Maintenance: 00:00 to 01:00 (1 hour daily)                    |
+//+------------------------------------------------------------------+
+#property copyright "C1 Strategy"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                 |
+//+------------------------------------------------------------------+
+
+//---------------- TRADE SETTINGS ----------------//
+
+input double LotSize                      = 0.01;
+input int    EMAPeriod                    = 50;       // EMA Period (days)
+input double StopLossPercent              = 60.0;     // Stop Loss % of investment
+
+//---------------- TRAILING STOP ----------------//
+
+input double TrailStart                   = 20.0;     // Start trailing at this profit ($)
+input double TrailStep                    = 10.0;     // Trail by this amount ($)
+
+//---------------- CLOSE BEFORE MARKET CLOSE ----------------//
+
+input int    CloseMinutesBeforeMarketClose = 5;       // Minutes before market close to exit
+
+//---------------- SAFETY ----------------//
+
+input ulong  MagicNumber                  = 201010;
+input ulong  Slippage                     = 30;
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                 |
+//+------------------------------------------------------------------+
+
+CTrade trade;
+
+double peakProfit = 0.0;
+bool tradeOpenedThisSession = false;
+int lastCheckedHour = -1;
+
+// EMA handle
+int emaHandle = INVALID_HANDLE;
+
+//+------------------------------------------------------------------+
+//| EXPERT INITIALIZATION                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   // Create EMA indicator on DAILY timeframe
+   emaHandle = iMA(_Symbol, PERIOD_D1, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(emaHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create EMA indicator");
+      return(INIT_FAILED);
+   }
+
+   Print("C1 Strategy Initialized: EMA Period=", EMAPeriod,
+         " | SL%=", StopLossPercent,
+         " | Trail Start=$", TrailStart,
+         " | Trail Step=$", TrailStep);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT DEINITIALIZATION                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(emaHandle != INVALID_HANDLE)
+      IndicatorRelease(emaHandle);
+
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+//| GET 50-DAY EMA VALUE                                             |
+//+------------------------------------------------------------------+
+double GetEMAValue()
+{
+   double emaBuffer[];
+   ArraySetAsSeries(emaBuffer, true);
+
+   if(CopyBuffer(emaHandle, 0, 0, 1, emaBuffer) <= 0)
+   {
+      Print("ERROR: Failed to get EMA value");
+      return 0.0;
+   }
+
+   return emaBuffer[0];
+}
+
+//+------------------------------------------------------------------+
+//| GET 1-HOUR CANDLE OPEN PRICE                                     |
+//+------------------------------------------------------------------+
+double GetH1CandleOpen()
+{
+   double openPrice = iOpen(_Symbol, PERIOD_H1, 0);
+   return openPrice;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF MARKET IS OPEN                                          |
+//+------------------------------------------------------------------+
+bool IsMarketOpen()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   // Weekend check
+   if(dt.day_of_week == 0)  // Sunday
+      return false;
+
+   if(dt.day_of_week == 6)  // Saturday
+   {
+      if(dt.hour >= 1)
+         return false;
+      else
+         return true;
+   }
+
+   // Daily maintenance: 00:00 to 01:00
+   if(dt.hour == 0)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF SHOULD CLOSE BEFORE MARKET CLOSE                        |
+//+------------------------------------------------------------------+
+bool ShouldCloseBeforeMarketClose()
+{
+   if(CloseMinutesBeforeMarketClose <= 0)
+      return false;
+
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   // Market closes at 00:00 (midnight)
+   // So we need to close X minutes before midnight (i.e., at 23:60-X)
+   int currentMinuteOfDay = dt.hour * 60 + dt.min;
+   int marketCloseMinute = 24 * 60;  // 00:00 = 1440 minutes
+
+   int closeThreshold = marketCloseMinute - CloseMinutesBeforeMarketClose;
+
+   if(currentMinuteOfDay >= closeThreshold)
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK IF NEW 1-HOUR CANDLE                                       |
+//+------------------------------------------------------------------+
+bool IsNewH1Candle()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(dt.hour != lastCheckedHour)
+   {
+      lastCheckedHour = dt.hour;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ALLOW TRADING                                                    |
+//+------------------------------------------------------------------+
+bool AllowTrading()
+{
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return false;
+
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return false;
+
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return false;
+
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| NORMALIZE LOT SIZE                                               |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathMax(minLot, lot);
+   lot = MathMin(maxLot, lot);
+   lot = MathRound(lot / lotStep) * lotStep;
+
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| COUNT OUR POSITIONS                                              |
+//+------------------------------------------------------------------+
+int TotalOurPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+            count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| GET POSITION PROFIT                                              |
+//+------------------------------------------------------------------+
+double GetPositionProfit()
+{
+   double profit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            profit += PositionGetDouble(POSITION_PROFIT) +
+                      PositionGetDouble(POSITION_SWAP);
+         }
+      }
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| GET POSITION INVESTMENT (margin used)                            |
+//+------------------------------------------------------------------+
+double GetPositionInvestment()
+{
+   double investment = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            // Calculate position value
+            double lotSize = PositionGetDouble(POSITION_VOLUME);
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+
+            investment = lotSize * contractSize * openPrice;
+         }
+      }
+   }
+   return investment;
+}
+
+//+------------------------------------------------------------------+
+//| CALCULATE STOP LOSS AMOUNT                                       |
+//+------------------------------------------------------------------+
+double CalculateStopLossAmount()
+{
+   double investment = GetPositionInvestment();
+   return investment * (StopLossPercent / 100.0);
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE ALL POSITIONS                                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions(string reason)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
+      if(trade.PositionClose(ticket))
+      {
+         Print("POSITION CLOSED: ", reason, " | Profit=$", DoubleToString(profit, 2));
+      }
+   }
+
+   // Reset for next session
+   peakProfit = 0.0;
+   tradeOpenedThisSession = false;
+}
+
+//+------------------------------------------------------------------+
+//| OPEN TRADE                                                       |
+//+------------------------------------------------------------------+
+void OpenTrade()
+{
+   if(!AllowTrading())
+      return;
+
+   if(!IsMarketOpen())
+      return;
+
+   if(TotalOurPositions() > 0)
+      return;
+
+   if(tradeOpenedThisSession)
+      return;
+
+   double emaValue = GetEMAValue();
+   double h1Open = GetH1CandleOpen();
+
+   if(emaValue <= 0)
+   {
+      Print("ERROR: Invalid EMA value");
+      return;
+   }
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   bool result = false;
+   string direction = "";
+
+   if(h1Open < emaValue)
+   {
+      // 1H candle open BELOW EMA → SELL
+      result = trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "C1_EMA_Sell");
+      direction = "SELL";
+   }
+   else if(h1Open > emaValue)
+   {
+      // 1H candle open ABOVE EMA → BUY
+      result = trade.Buy(NormalizeLot(LotSize), _Symbol, ask, 0, 0, "C1_EMA_Buy");
+      direction = "BUY";
+   }
+   else
+   {
+      // Exactly at EMA - skip
+      Print("H1 Open exactly at EMA, skipping trade");
+      return;
+   }
+
+   if(result)
+   {
+      tradeOpenedThisSession = true;
+      peakProfit = 0.0;
+      Print("TRADE OPENED: ", direction,
+            " | H1 Open=", DoubleToString(h1Open, 2),
+            " | EMA=", DoubleToString(emaValue, 2),
+            " | Lot=", NormalizeLot(LotSize));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE POSITION                                                  |
+//+------------------------------------------------------------------+
+void ManagePosition()
+{
+   if(TotalOurPositions() == 0)
+      return;
+
+   double profit = GetPositionProfit();
+
+   // Update peak profit
+   if(profit > peakProfit)
+      peakProfit = profit;
+
+   // Check stop loss (60% of investment)
+   double stopLossAmount = CalculateStopLossAmount();
+   if(profit <= -stopLossAmount)
+   {
+      Print("STOP LOSS triggered: Profit=$", DoubleToString(profit, 2),
+            " | SL Amount=$", DoubleToString(stopLossAmount, 2));
+      CloseAllPositions("STOP LOSS");
+      return;
+   }
+
+   // Check trailing stop
+   if(peakProfit >= TrailStart)
+   {
+      double trailLevel = peakProfit - TrailStep;
+
+      if(profit <= trailLevel)
+      {
+         Print("TRAILING STOP triggered: Peak=$", DoubleToString(peakProfit, 2),
+               " | Current=$", DoubleToString(profit, 2),
+               " | Trail Level=$", DoubleToString(trailLevel, 2));
+         CloseAllPositions("TRAILING STOP");
+         return;
+      }
+   }
+
+   // Check close before market close
+   if(ShouldCloseBeforeMarketClose())
+   {
+      Print("MARKET CLOSE: Closing position before market close");
+      CloseAllPositions("MARKET CLOSE");
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| RESET SESSION FLAGS AT NEW DAY                                   |
+//+------------------------------------------------------------------+
+void CheckDayReset()
+{
+   static int lastDay = -1;
+
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(dt.day_of_year != lastDay)
+   {
+      lastDay = dt.day_of_year;
+      tradeOpenedThisSession = false;
+      Print("NEW DAY: Session reset, ready for new trade");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD                                                        |
+//+------------------------------------------------------------------+
+void Dashboard()
+{
+   double emaValue = GetEMAValue();
+   double h1Open = GetH1CandleOpen();
+   double profit = GetPositionProfit();
+   int posCount = TotalOurPositions();
+
+   string signal = "NONE";
+   if(emaValue > 0)
+   {
+      if(h1Open < emaValue)
+         signal = "SELL (H1 Open < EMA)";
+      else if(h1Open > emaValue)
+         signal = "BUY (H1 Open > EMA)";
+   }
+
+   string trailStatus = "Waiting";
+   double trailLevel = 0;
+   if(peakProfit >= TrailStart)
+   {
+      trailStatus = "ACTIVE";
+      trailLevel = peakProfit - TrailStep;
+   }
+
+   double stopLossAmount = 0;
+   if(posCount > 0)
+      stopLossAmount = CalculateStopLossAmount();
+
+   string marketStatus = IsMarketOpen() ? "OPEN" : "CLOSED";
+   string closeWarning = ShouldCloseBeforeMarketClose() ? "CLOSING SOON!" : "OK";
+
+   Comment(
+      "=== C1: EMA SINGLE TRADE STRATEGY ===\n",
+
+      "\n--- EMA SIGNAL ---",
+      "\n50-Day EMA: ", DoubleToString(emaValue, 2),
+      "\n1H Candle Open: ", DoubleToString(h1Open, 2),
+      "\nSignal: ", signal,
+
+      "\n\n--- POSITION ---",
+      "\nPositions: ", IntegerToString(posCount),
+      "\nProfit/Loss: $", DoubleToString(profit, 2),
+      "\nTrade Opened Today: ", tradeOpenedThisSession ? "YES" : "NO",
+
+      "\n\n--- STOP LOSS ---",
+      "\nSL Percent: ", DoubleToString(StopLossPercent, 1), "%",
+      "\nSL Amount: $", DoubleToString(stopLossAmount, 2),
+
+      "\n\n--- TRAILING STOP ---",
+      "\nPeak Profit: $", DoubleToString(peakProfit, 2),
+      "\nTrail Start: $", DoubleToString(TrailStart, 2),
+      "\nTrail Step: $", DoubleToString(TrailStep, 2),
+      "\nTrail Status: ", trailStatus,
+      "\nTrail Level: ", (trailStatus == "ACTIVE") ? ("$" + DoubleToString(trailLevel, 2)) : "N/A",
+
+      "\n\n--- MARKET ---",
+      "\nMarket: ", marketStatus,
+      "\nClose Status: ", closeWarning,
+      "\nClose Buffer: ", IntegerToString(CloseMinutesBeforeMarketClose), " min"
+   );
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT TICK FUNCTION                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Check for new day reset
+   CheckDayReset();
+
+   // Check if market is open
+   if(!IsMarketOpen())
+   {
+      Dashboard();
+      return;
+   }
+
+   // If we have a position, manage it
+   if(TotalOurPositions() > 0)
+   {
+      ManagePosition();
+      Dashboard();
+      return;
+   }
+
+   // No position - check for new trade on new 1H candle
+   if(IsNewH1Candle() && !tradeOpenedThisSession)
+   {
+      OpenTrade();
+   }
+
+   Dashboard();
+}
+//+------------------------------------------------------------------+
