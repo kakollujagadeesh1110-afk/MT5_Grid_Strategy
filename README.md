@@ -1266,7 +1266,7 @@ During March and November, there are brief periods when one market has switched 
 
 ---
 
-## B10: Advanced Dynamic Strategy (NEW in V8)
+## B10: Advanced Dynamic Strategy (NEW in V8, Updated V9)
 
 ### Overview
 
@@ -1276,63 +1276,126 @@ B10 is a specialized strategy designed for **24/7 automated trading** with intel
 |---------|-------------|
 | Grid Type | Incremental (200 × N points) |
 | Hedging | NO |
-| Profit Exit | Trailing Stop ONLY (no fixed target) |
-| Stop Loss | DYNAMIC ($75 - $300 based on day profit) |
+| Profit Exit | Dynamic Trailing Stop (position-based step + min floor) |
+| Stop Loss | LOT-SCALED ($75-$300 base, scales with lot size) |
 | Time Filters | NONE (runs 24/7, year-round) |
 | Direction | ALWAYS switches after every trade |
 
 ### Key Features
 
-#### 1. Dynamic Stop Loss
+#### 1. Lot-Scaled Dynamic Stop Loss (V9 NEW)
 
-The stop loss adjusts based on the day's cumulative profit:
+All stop loss parameters **automatically scale** based on lot size using a multiplier:
 
 ```
-IF dayProfit <= $85:
-   stopLoss = $75 (minimum)
+Multiplier = LotSize / 0.1
+```
+
+**Base Values (for 0.1 lot):**
+| Parameter | Base Value |
+|-----------|------------|
+| Min Stop Loss | $75 |
+| Max Stop Loss | $300 |
+| SL Threshold | $85 |
+| SL Cushion | $10 |
+
+**Scaled Examples:**
+| Lot Size | Multiplier | Min SL | Max SL | SL Threshold | SL Cushion |
+|----------|------------|--------|--------|--------------|------------|
+| 0.1 | 1× | $75 | $300 | $85 | $10 |
+| 0.2 | 2× | $150 | $600 | $170 | $20 |
+| 0.3 | 3× | $225 | $900 | $255 | $30 |
+| 0.5 | 5× | $375 | $1500 | $425 | $50 |
+
+**Dynamic SL Logic:**
+```
+IF dayProfit <= scaledSLThreshold:
+   stopLoss = scaledMinSL
 ELSE:
-   stopLoss = dayProfit - $10 (capped at $300)
+   stopLoss = dayProfit - scaledCushion (capped at scaledMaxSL)
 ```
 
-| Day Profit | Stop Loss Applied |
-|------------|-------------------|
-| $0 - $85 | $75 (minimum) |
-| $100 | $90 |
-| $150 | $140 |
-| $200 | $190 |
-| $310+ | $300 (maximum) |
+**Why Lot-Scaling?** Larger positions have proportionally larger profit/loss swings. A 0.2 lot position moves twice as much in dollar terms as a 0.1 lot, so stop loss and thresholds should scale accordingly.
 
-**Why?** Protects profits as they accumulate. Early in the day, use tight stop loss. As profits grow, allow more room for trades to breathe.
+#### 2. Lot-Scaled Dynamic Pause Time After Stop Loss (V9 Updated)
 
-#### 2. Dynamic Pause Time After Stop Loss
+Pause durations based on stop loss amount hit. **Thresholds scale with lot size:**
 
-Different pause durations based on stop loss amount hit:
+**Base Thresholds (for 0.1 lot):**
+| Stop Loss Hit | Pause Duration |
+|---------------|----------------|
+| < $75 | 0 minutes |
+| $75 - $149 | 5 minutes |
+| $150 - $199 | 30 minutes |
+| $200 - $249 | 45 minutes |
+| $250 - $300 | 60 minutes |
 
-| Stop Loss Hit | Pause Duration | Reason |
-|---------------|----------------|--------|
-| < $75 | 0 minutes | Edge case - below minimum SL |
-| $75 - $149 | 5 minutes | Small loss, brief cooldown |
-| $150 - $199 | 30 minutes | Moderate loss, longer cooldown |
-| $200 - $249 | 45 minutes | Significant loss, extended cooldown |
-| $250 - $300 | 60 minutes | Large loss, full hour reset |
+**Scaled Thresholds (for 0.2 lot = 2× multiplier):**
+| Stop Loss Hit | Pause Duration |
+|---------------|----------------|
+| < $150 | 0 minutes |
+| $150 - $299 | 5 minutes |
+| $300 - $399 | 30 minutes |
+| $400 - $499 | 45 minutes |
+| $500 - $600 | 60 minutes |
 
 **Direction always switches** regardless of pause duration.
 
-#### 3. Daily Target
+#### 3. Dynamic Trailing Stop Based on Position Count (V9 NEW)
+
+The trailing stop step **dynamically adjusts** based on how many positions are open:
+
+**Formula:**
+```
+Trail Step = TrailStepBase + (positions - 1) × TrailStepMultiplier
+Close Level = max(PeakProfit - TrailStep, MinTrailProfit)
+```
+
+**Default Values (configurable inputs):**
+| Parameter | Default |
+|-----------|---------|
+| GridTrailStart | $20 |
+| TrailStepBase | $10 |
+| TrailStepMultiplier | $9 |
+| MinTrailProfit | $10 |
+
+**Resulting Trail Steps:**
+| Positions | Trail Step | Calculation |
+|-----------|------------|-------------|
+| 1 | $10 | 10 + 0×9 |
+| 2 | $19 | 10 + 1×9 |
+| 3 | $28 | 10 + 2×9 |
+| 4 | $37 | 10 + 3×9 |
+
+**Example with 2 positions, peak profit = $25:**
+```
+Trail Step = $19
+Raw Close Level = $25 - $19 = $6
+Min Floor = $10
+Actual Close Level = max($6, $10) = $10 ✓
+```
+
+**Why Position-Based Trailing?**
+- With 1 position, a $10 swing is significant and likely indicates direction change
+- With multiple positions, the same $10 swing is relatively smaller (more noise)
+- Larger step for more positions prevents premature exits from small fluctuations
+- The $10 minimum floor ensures you always book at least $10 profit once trailing activates
+
+#### 4. Daily Target
 
 - Input: `DailyTarget = 200.0` (default)
 - When day's net profit reaches target, stop opening new trades
 - Active grid continues until closed (trailing/stop loss)
 - Resets at midnight (00:00 UTC+3)
 
-#### 4. Daily Loss Limit
+#### 5. Daily Loss Limit
 
 - Input: `DailyLossLimit = 500.0` (default)
 - When day's net loss reaches limit, stop opening new trades
 - Protects against catastrophic daily losses
 - Resets at midnight (00:00 UTC+3)
 
-#### 5. Market Pause Buffers
+#### 6. Market Pause Buffers
 
 Optional pauses around market open/close times:
 
@@ -1348,40 +1411,41 @@ Optional pauses around market open/close times:
 
 **Active trade handling:** If a grid is open when pause starts, it continues to be managed (can close via trailing/stop loss).
 
-#### 6. Direction Always Switches
+#### 7. Direction Always Switches
 
 After **every** completed trade (profit OR loss), direction switches:
 - BUY grid closes → Next grid is SELL
 - SELL grid closes → Next grid is BUY
 - No exceptions, regardless of close reason
 
-### B10 Input Parameters
+### B10 Input Parameters (V9 Updated)
 
 ```cpp
 //--- GRID SETTINGS ---
-input double LotSize                      = 0.01;
+input double LotSize                      = 0.01;   // Also used for lot multiplier
 input int    MaxTrades                    = 10;
 input int    BaseGridDistance             = 200;    // Points
 input int    GridIncrementStep            = 200;    // Points
 
-//--- TRAILING STOP ---
+//--- TRAILING STOP (V9 - Position-based dynamic step) ---
 input double GridTrailStart               = 20.0;   // Activate at this profit ($)
-input double GridTrailStep                = 10.0;   // Trail by this amount ($)
+input double TrailStepBase                = 10.0;   // Base trail step for 1 position ($)
+input double TrailStepMultiplier          = 9.0;    // Additional step per extra position ($)
+input double MinTrailProfit               = 10.0;   // Minimum profit floor after trailing starts ($)
 
-//--- DYNAMIC STOP LOSS ---
-input double MinStopLoss                  = 75.0;   // Minimum stop loss ($)
-input double MaxStopLoss                  = 300.0;  // Maximum stop loss ($)
-input double DynamicSLThreshold           = 85.0;   // Day profit threshold ($)
+//--- DYNAMIC STOP LOSS (V9 - Auto-scaled by lot size) ---
+// Base values (for 0.1 lot): MinSL=$75, MaxSL=$300, Threshold=$85, Cushion=$10
+// Actual values = Base × (LotSize / 0.1)
 
 //--- DAILY LIMITS ---
-input double DailyTarget                  = 200.0;  // Stop when reached ($)
-input double DailyLossLimit               = 500.0;  // Stop when loss reaches this ($)
+input double DailyTarget                  = 200.0;  // Stop when reached ($) - NOT scaled
+input double DailyLossLimit               = 500.0;  // Stop when loss reaches this ($) - NOT scaled
 
-//--- DYNAMIC DAILY TARGET (based on loss) ---
-input double LossThreshold1               = 200.0;  // When day loss >= this, reduce target
-input double ReducedTarget1               = 50.0;   // New target after LossThreshold1
-input double LossThreshold2               = 300.0;  // When day loss >= this, reduce further
-input double ReducedTarget2               = 10.0;   // New target after LossThreshold2
+//--- DYNAMIC DAILY TARGET (V9 - Auto-scaled by lot size) ---
+// Base values (for 0.1 lot):
+// LossThreshold1=$200 -> ReducedTarget1=$50
+// LossThreshold2=$300 -> ReducedTarget2=$10
+// Actual values scale with lot size
 
 //--- MARKET PAUSE BUFFERS ---
 input int    PauseMinutesAfterMarketOpen  = 0;      // Minutes after 01:00
@@ -1392,43 +1456,58 @@ input ulong  MagicNumber                  = 101010;
 input ulong  Slippage                     = 30;     // Max price deviation in points
 ```
 
-**Note:** B10 uses `SetTypeFillingBySymbol()` for automatic broker compatibility (no hardcoded fill type).
+**Notes:**
+- B10 uses `SetTypeFillingBySymbol()` for automatic broker compatibility
+- Stop loss parameters auto-scale based on `LotSize / 0.1` multiplier
+- DailyTarget and DailyLossLimit are manual inputs (NOT scaled)
 
-#### 7. Dynamic Daily Target (Based on Loss)
+#### 8. Lot-Scaled Dynamic Daily Target (V9 Updated)
 
-When the day's cumulative loss reaches certain thresholds, the daily target is automatically reduced:
+When the day's cumulative loss reaches certain thresholds, the daily target is automatically reduced. **Thresholds and reduced targets scale with lot size:**
 
+**Base Values (for 0.1 lot):**
 | Day Net Profit | Daily Target Applied |
 |----------------|---------------------|
-| >= -$199 | Original ($200 default) |
+| >= -$199 | Original (input DailyTarget) |
 | <= -$200 | Reduced to $50 (Level 1) |
 | <= -$300 | Reduced to $10 (Level 2) |
 
+**Scaled Values (for 0.2 lot = 2× multiplier):**
+| Day Net Profit | Daily Target Applied |
+|----------------|---------------------|
+| >= -$399 | Original (input DailyTarget) |
+| <= -$400 | Reduced to $100 (Level 1) |
+| <= -$600 | Reduced to $20 (Level 2) |
+
 **Important Rules:**
 - Once a threshold is hit, the reduced target stays for the rest of the day
-- Even if profit recovers (e.g., from -$250 to -$100), the target remains reduced
+- Even if profit recovers (e.g., from -$500 to -$200), the target remains reduced
 - Level 2 takes precedence over Level 1
 - Flags reset at midnight (00:00 UTC+3)
 
-**Example Scenario:**
+**Example Scenario (0.2 lot):**
 ```
-Day starts: DailyTarget = $200
+Day starts: DailyTarget = $400 (user input)
+Lot Size = 0.2 → Multiplier = 2×
+Loss Threshold 1 = $400, Reduced Target 1 = $100
+Loss Threshold 2 = $600, Reduced Target 2 = $20
 
-Trade 1: -$75 stop loss → dayNetProfit = -$75 → Target still $200
-Trade 2: +$40 profit → dayNetProfit = -$35 → Target still $200
-Trade 3: -$75 stop loss → dayNetProfit = -$110 → Target still $200
-Trade 4: -$150 stop loss → dayNetProfit = -$260 → LEVEL 1 HIT → Target now $50
+Trade 1: -$150 stop loss → dayNetProfit = -$150 → Target still $400
+Trade 2: +$80 profit → dayNetProfit = -$70 → Target still $400
+Trade 3: -$150 stop loss → dayNetProfit = -$220 → Target still $400
+Trade 4: -$300 stop loss → dayNetProfit = -$520 → LEVEL 1 HIT → Target now $100
 
-(If profit recovers to -$100, target REMAINS $50)
+(If profit recovers to -$200, target REMAINS $100)
 
-Trade 5: -$75 stop loss → dayNetProfit = -$335 → LEVEL 2 HIT → Target now $10
+Trade 5: -$150 stop loss → dayNetProfit = -$670 → LEVEL 2 HIT → Target now $20
 
-(Even if profit recovers to +$50, target REMAINS $10 for rest of day)
+(Even if profit recovers to +$100, target REMAINS $20 for rest of day)
 ```
 
 **Why This Matters:**
 - After significant losses, it's harder to recover to original target
 - Reduced target allows earlier exit to preserve remaining capital
+- Lot-scaling ensures thresholds are proportional to position size
 - Prevents "revenge trading" by setting achievable goals after losses
 
 ### B10 Example Trading Day
@@ -1634,7 +1713,7 @@ Next day: Ready for new trade based on EMA signal
     - Overall trading status with clear day/time context
   - All features work year-round with automatic DST handling
   - 16 total strategy variations available
-- **v8 (Current)**: Added B10 with dynamic features for 24/7 trading
+- **v8**: Added B10 with dynamic features for 24/7 trading
   - **B10**: Incremental + No Hedge + Dynamic Stop Loss + Trailing Only
   - **NEW FEATURES**:
     - **Dynamic Stop Loss**: Adjusts from $75-$300 based on day profit
@@ -1671,6 +1750,26 @@ Next day: Ready for new trade based on EMA signal
     - Profit exit: Trailing stop only
     - Auto-close before market close
   - 18 total strategy variations available
+- **v9 (Current)**: B10 enhancements - Lot-scaling and Dynamic Trailing
+  - **B10 LOT-SCALED PARAMETERS**: All stop loss parameters now auto-scale based on lot size
+    - Multiplier formula: `LotSize / 0.1`
+    - Base values (for 0.1 lot): MinSL=$75, MaxSL=$300, SLThreshold=$85, SLCushion=$10
+    - Example (0.2 lot = 2× multiplier): MinSL=$150, MaxSL=$600, etc.
+    - Loss thresholds and reduced targets also scale
+    - Pause time thresholds scale with lot size
+  - **B10 DYNAMIC TRAILING STOP**: Trail step based on position count
+    - Formula: `TrailStepBase + (positions - 1) × TrailStepMultiplier`
+    - Default: 1 pos=$10, 2 pos=$19, 3 pos=$28, 4 pos=$37
+    - Minimum profit floor ($10) after trailing activates
+    - Prevents premature exits from noise with multiple positions
+  - **NEW INPUT PARAMETERS (B10)**:
+    - `TrailStepBase = 10.0` - Base trail step for 1 position
+    - `TrailStepMultiplier = 9.0` - Additional step per extra position
+    - `MinTrailProfit = 10.0` - Minimum profit floor after trailing starts
+  - **REMOVED INPUT PARAMETERS (B10)**: Now auto-calculated based on lot size
+    - MinStopLoss, MaxStopLoss, DynamicSLThreshold (now scaled from base values)
+    - LossThreshold1/2, ReducedTarget1/2 (now scaled from base values)
+  - **DASHBOARD UPDATES (B10)**: Shows lot multiplier and all scaled values
 
 ---
 
