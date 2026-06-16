@@ -54,7 +54,7 @@ Each file follows the pattern: `{Series}{Number}_{strategy-type}_{features}.mq5`
 
 | File | Strategy | Entry Signal | Hedge | Trailing | Stop Loss |
 |------|----------|--------------|-------|----------|-----------|
-| **C1_ema_single_trade** | Single Trade | 1H Open vs 50-day EMA | No | Yes | 60% of investment |
+| **C1_ema_single_trade** | Single Trade | 1H Open vs N-day EMA (D1, completed bar) | No | Yes | 60% of investment |
 
 **NEW (V8):** B10 includes **dynamic stop loss**, **daily limits**, and **24/7 trading** - see section below.
 
@@ -1554,7 +1554,7 @@ Tuesday 01:00:
 
 ---
 
-## C1: EMA Single Trade Strategy (NEW in V8)
+## C1: EMA Single Trade Strategy (NEW in V8, Updated V9)
 
 ### Overview
 
@@ -1563,7 +1563,8 @@ C1 is a simple **single lot, single trade strategy** based on EMA crossover sign
 | Feature | Description |
 |---------|-------------|
 | Strategy Type | Single Trade (one position at a time) |
-| Entry Signal | 1H candle open vs 50-day EMA |
+| Entry Signal | 1H candle open vs N-day EMA (default 50) |
+| EMA Timeframe | Daily (D1), using last COMPLETED bar |
 | Position Size | Single lot (configurable) |
 | Stop Loss | 60% of investment (configurable) |
 | Profit Exit | Trailing Stop Only |
@@ -1571,17 +1572,41 @@ C1 is a simple **single lot, single trade strategy** based on EMA crossover sign
 
 ### Entry Logic
 
-The strategy checks the 1-hour candle open price against the 50-day EMA:
+The strategy checks the 1-hour candle open price against the N-day EMA:
 
 ```
-IF 1H candle open BELOW 50-day EMA:
-   → Open SELL position
+IF 1H candle open BELOW EMA:
+   → Open SELL position (bearish - price below average)
 
-IF 1H candle open ABOVE 50-day EMA:
-   → Open BUY position
+IF 1H candle open ABOVE EMA:
+   → Open BUY position (bullish - price above average)
 ```
 
 **One trade per day** - once a trade is opened, no new trades until the next day.
+
+### EMA Calculation (V9 Fix)
+
+The EMA is calculated on the **Daily (D1) timeframe** using the **last completed bar** (index 1):
+
+```
+EMA Source: PERIOD_D1 (Daily candles)
+EMA Index:  1 (yesterday's completed bar, NOT today's incomplete bar)
+EMA Type:   Exponential Moving Average on Close prices
+```
+
+**Why index 1 instead of index 0?**
+- Index 0 = Today's bar (still forming, "close" = current price)
+- Index 1 = Yesterday's bar (completed, actual close price)
+
+Using index 0 would cause:
+- EMA value changing every tick throughout the day
+- Signal flipping BUY → SELL → BUY multiple times
+- Inconsistent and unreliable signals
+
+Using index 1 ensures:
+- Stable EMA value throughout the trading day
+- Consistent signal until next day
+- True EMA based on historical closing prices
 
 ### Exit Conditions
 
@@ -1750,7 +1775,7 @@ Next day: Ready for new trade based on EMA signal
     - Profit exit: Trailing stop only
     - Auto-close before market close
   - 18 total strategy variations available
-- **v9 (Current)**: B10 enhancements - Lot-scaling and Dynamic Trailing
+- **v9 (Current)**: B10 enhancements + C1 EMA fix
   - **B10 LOT-SCALED PARAMETERS**: All stop loss parameters now auto-scale based on lot size
     - Multiplier formula: `LotSize / 0.1`
     - Base values (for 0.1 lot): MinSL=$75, MaxSL=$300, SLThreshold=$85, SLCushion=$10
@@ -1770,6 +1795,11 @@ Next day: Ready for new trade based on EMA signal
     - MinStopLoss, MaxStopLoss, DynamicSLThreshold (now scaled from base values)
     - LossThreshold1/2, ReducedTarget1/2 (now scaled from base values)
   - **DASHBOARD UPDATES (B10)**: Shows lot multiplier and all scaled values
+  - **C1 EMA FIX**: Fixed incorrect EMA calculation
+    - **Bug**: EMA was using index 0 (current incomplete daily bar)
+    - **Fix**: Now uses index 1 (last completed daily bar)
+    - **Impact**: EMA value is now stable throughout the day, signals are consistent
+    - Dashboard now shows which date the EMA is calculated from
 
 ---
 
