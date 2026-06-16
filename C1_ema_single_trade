@@ -324,9 +324,13 @@ void CloseAllPositions(string reason)
       }
    }
 
-   // Reset for next session
+   // Reset peak profit for next trade
    peakProfit = 0.0;
-   tradeOpenedThisSession = false;
+
+   // NOTE: Do NOT reset tradeOpenedThisSession here!
+   // We want only ONE trade per DAY, so keep the flag true.
+   // It will only be reset in CheckDayReset() when a new day starts.
+   Print("Position closed. tradeOpenedThisSession=", tradeOpenedThisSession, " (no new trades today)");
 }
 
 //+------------------------------------------------------------------+
@@ -362,27 +366,30 @@ void OpenTrade()
    string direction = "";
 
    // Log values for debugging
-   Print("EMA Check: H1 Open=", DoubleToString(h1Open, 2),
-         " | 50-Day EMA=", DoubleToString(emaValue, 2),
-         " | Difference=", DoubleToString(h1Open - emaValue, 2));
+   Print("=== C1 TRADE DECISION ===");
+   Print("H1 Candle Open Price: ", DoubleToString(h1Open, 5));
+   Print("50-Day EMA Value: ", DoubleToString(emaValue, 5));
+   Print("Difference (H1 - EMA): ", DoubleToString(h1Open - emaValue, 5));
 
    // TREND-FOLLOWING LOGIC:
-   // - Price ABOVE EMA (bullish trend) → BUY
-   // - Price BELOW EMA (bearish trend) → SELL
+   // - H1 Open ABOVE EMA → BUY (price is above average, bullish)
+   // - H1 Open BELOW EMA → SELL (price is below average, bearish)
 
    if(h1Open > emaValue)
    {
-      // 1H candle open ABOVE EMA → BUY (bullish)
+      // H1 candle open is ABOVE 50-day EMA → Take BUY position
+      Print("DECISION: H1 Open (", DoubleToString(h1Open, 2), ") > EMA (", DoubleToString(emaValue, 2), ")");
+      Print("ACTION: Opening BUY trade");
       result = trade.Buy(NormalizeLot(LotSize), _Symbol, ask, 0, 0, "C1_EMA_Buy");
       direction = "BUY";
-      Print("Signal: H1 Open (", DoubleToString(h1Open, 2), ") > EMA (", DoubleToString(emaValue, 2), ") → BUY");
    }
    else if(h1Open < emaValue)
    {
-      // 1H candle open BELOW EMA → SELL (bearish)
+      // H1 candle open is BELOW 50-day EMA → Take SELL position
+      Print("DECISION: H1 Open (", DoubleToString(h1Open, 2), ") < EMA (", DoubleToString(emaValue, 2), ")");
+      Print("ACTION: Opening SELL trade");
       result = trade.Sell(NormalizeLot(LotSize), _Symbol, bid, 0, 0, "C1_EMA_Sell");
       direction = "SELL";
-      Print("Signal: H1 Open (", DoubleToString(h1Open, 2), ") < EMA (", DoubleToString(emaValue, 2), ") → SELL");
    }
    else
    {
