@@ -919,51 +919,54 @@ void Dashboard()
       trailLevel = gridPeakProfit - GridTrailStep;
    }
 
-   Comment(
-      "=== B10: INCREMENTAL GRID - DYNAMIC STOP LOSS ===\n",
+   string trailLevelStr = (trailStatus == "ACTIVE") ? ("$" + DoubleToString(trailLevel, 2)) : "N/A";
+   string threshold1Hit = targetReducedToLevel1 ? " [HIT]" : "";
+   string threshold2Hit = targetReducedToLevel2 ? " [HIT]" : "";
 
-      "\n--- GRID STATUS ---",
-      "\nPositions: ", IntegerToString(gridCount),
-      "\nDirection: ", (currentDirection == 0) ? "BUY" : "SELL",
-      "\nNext Distance: ", IntegerToString(GetIncrementalGridDistance()), " pts",
+   // Build dashboard string
+   string dash = "=== B10: INCREMENTAL GRID - DYNAMIC STOP LOSS ===\n";
 
-      "\n\n--- PROFIT/LOSS ---",
-      "\nGrid Floating P/L: $", DoubleToString(gridProfit, 2),
-      "\nDay Net Profit: $", DoubleToString(dayNetProfit, 2),
+   dash += "\n--- GRID STATUS ---";
+   dash += "\nPositions: " + IntegerToString(gridCount);
+   dash += "\nDirection: " + ((currentDirection == 0) ? "BUY" : "SELL");
+   dash += "\nNext Distance: " + IntegerToString(GetIncrementalGridDistance()) + " pts";
 
-      "\n\n--- TRAILING STOP ---",
-      "\nPeak Profit: $", DoubleToString(gridPeakProfit, 2),
-      "\nTrail Start: $", DoubleToString(GridTrailStart, 2),
-      "\nTrail Step: $", DoubleToString(GridTrailStep, 2),
-      "\nTrail Status: ", trailStatus,
-      "\nTrail Level: ", (trailStatus == "ACTIVE") ? ("$" + DoubleToString(trailLevel, 2)) : "N/A",
+   dash += "\n\n--- PROFIT/LOSS ---";
+   dash += "\nGrid Floating P/L: $" + DoubleToString(gridProfit, 2);
+   dash += "\nDay Net Profit: $" + DoubleToString(dayNetProfit, 2);
 
-      "\n\n--- DYNAMIC STOP LOSS ---",
-      "\nCurrent Stop Loss: $", DoubleToString(currentStopLoss, 2),
-      "\nMin/Max SL: $", DoubleToString(MinStopLoss, 2), " / $", DoubleToString(MaxStopLoss, 2),
-      "\nSL Threshold: $", DoubleToString(DynamicSLThreshold, 2),
+   dash += "\n\n--- TRAILING STOP ---";
+   dash += "\nPeak Profit: $" + DoubleToString(gridPeakProfit, 2);
+   dash += "\nTrail Start: $" + DoubleToString(GridTrailStart, 2);
+   dash += "\nTrail Step: $" + DoubleToString(GridTrailStep, 2);
+   dash += "\nTrail Status: " + trailStatus;
+   dash += "\nTrail Level: " + trailLevelStr;
 
-      "\n\n--- DAILY LIMITS ---",
-      "\nOriginal Target: $", DoubleToString(DailyTarget, 2),
-      "\nEffective Target: $", DoubleToString(effectiveTarget, 2), " (", dailyTargetStatus, ")",
-      "\nTarget Reduction: ", targetReductionStatus,
-      "\nDaily Loss Limit: $", DoubleToString(DailyLossLimit, 2), " (", dailyLossStatus, ")",
+   dash += "\n\n--- DYNAMIC STOP LOSS ---";
+   dash += "\nCurrent Stop Loss: $" + DoubleToString(currentStopLoss, 2);
+   dash += "\nMin/Max SL: $" + DoubleToString(MinStopLoss, 2) + " / $" + DoubleToString(MaxStopLoss, 2);
+   dash += "\nSL Threshold: $" + DoubleToString(DynamicSLThreshold, 2);
 
-      "\n\n--- LOSS THRESHOLDS ---",
-      "\nThreshold 1: -$", DoubleToString(LossThreshold1, 0), " -> Target $", DoubleToString(ReducedTarget1, 0),
-      (targetReducedToLevel1 ? " [HIT]" : ""),
-      "\nThreshold 2: -$", DoubleToString(LossThreshold2, 0), " -> Target $", DoubleToString(ReducedTarget2, 0),
-      (targetReducedToLevel2 ? " [HIT]" : ""),
+   dash += "\n\n--- DAILY LIMITS ---";
+   dash += "\nOriginal Target: $" + DoubleToString(DailyTarget, 2);
+   dash += "\nEffective Target: $" + DoubleToString(effectiveTarget, 2) + " (" + dailyTargetStatus + ")";
+   dash += "\nTarget Reduction: " + targetReductionStatus;
+   dash += "\nDaily Loss Limit: $" + DoubleToString(DailyLossLimit, 2) + " (" + dailyLossStatus + ")";
 
-      "\n\n--- PAUSE STATUS ---",
-      "\nDynamic Pause: ", pauseStatus,
-      "\nMarket: ", marketStatus,
-      "\nIn Buffer Zone: ", bufferStatus,
+   dash += "\n\n--- LOSS THRESHOLDS ---";
+   dash += "\nThreshold 1: -$" + DoubleToString(LossThreshold1, 0) + " -> Target $" + DoubleToString(ReducedTarget1, 0) + threshold1Hit;
+   dash += "\nThreshold 2: -$" + DoubleToString(LossThreshold2, 0) + " -> Target $" + DoubleToString(ReducedTarget2, 0) + threshold2Hit;
 
-      "\n\n--- MARKET BUFFERS ---",
-      "\nPause After Open: ", IntegerToString(PauseMinutesAfterMarketOpen), " min",
-      "\nPause Before Close: ", IntegerToString(PauseMinutesBeforeMarketClose), " min"
-   );
+   dash += "\n\n--- PAUSE STATUS ---";
+   dash += "\nDynamic Pause: " + pauseStatus;
+   dash += "\nMarket: " + marketStatus;
+   dash += "\nIn Buffer Zone: " + bufferStatus;
+
+   dash += "\n\n--- MARKET BUFFERS ---";
+   dash += "\nPause After Open: " + IntegerToString(PauseMinutesAfterMarketOpen) + " min";
+   dash += "\nPause Before Close: " + IntegerToString(PauseMinutesBeforeMarketClose) + " min";
+
+   Comment(dash);
 }
 
 //+------------------------------------------------------------------+
