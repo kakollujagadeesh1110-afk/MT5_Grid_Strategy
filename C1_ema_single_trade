@@ -5,12 +5,15 @@
 //|                                                                  |
 //|  FEATURES:                                                       |
 //|  - Single lot, single trade at a time                            |
-//|  - Entry based on 1H candle open vs 50-day EMA                   |
-//|  - If 1H open BELOW EMA → SELL                                   |
-//|  - If 1H open ABOVE EMA → BUY                                    |
-//|  - Stop loss at 60% of investment                                |
+//|  - Entry based on 1H candle open vs N-day EMA (default 50)       |
+//|  - EMA calculated on DAILY timeframe (D1), using LAST COMPLETED  |
+//|    bar (index 1) for stable value throughout the day             |
+//|  - If 1H open BELOW EMA → SELL (bearish)                         |
+//|  - If 1H open ABOVE EMA → BUY (bullish)                          |
+//|  - Stop loss at configurable % of investment (default 60%)       |
 //|  - Trailing stop loss for profit locking                         |
 //|  - Auto-close before market close                                |
+//|  - One trade per day only                                        |
 //|                                                                  |
 //|  XAUUSD MARKET HOURS (UTC+3):                                    |
 //|  - Daily: 01:00 to 00:00 (23 hours)                              |
@@ -97,16 +100,20 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| GET 50-DAY EMA VALUE                                             |
+//| GET 50-DAY EMA VALUE (from last COMPLETED daily bar)             |
+//| Using index 1 (yesterday) instead of 0 (today's incomplete bar)  |
+//| This ensures stable EMA value throughout the trading day         |
 //+------------------------------------------------------------------+
 double GetEMAValue()
 {
    double emaBuffer[];
    ArraySetAsSeries(emaBuffer, true);
 
-   if(CopyBuffer(emaHandle, 0, 0, 1, emaBuffer) <= 0)
+   // Get EMA from index 1 (last completed daily bar)
+   // Index 0 would be the current incomplete bar which changes during the day
+   if(CopyBuffer(emaHandle, 0, 1, 1, emaBuffer) <= 0)
    {
-      Print("ERROR: Failed to get EMA value");
+      Print("ERROR: Failed to get EMA value. Error: ", GetLastError());
       return 0.0;
    }
 
@@ -509,12 +516,17 @@ void Dashboard()
    string marketStatus = IsMarketOpen() ? "OPEN" : "CLOSED";
    string closeWarning = ShouldCloseBeforeMarketClose() ? "CLOSING SOON!" : "OK";
 
+   // Get the date of the EMA bar (yesterday's completed bar)
+   datetime emaBarTime = iTime(_Symbol, PERIOD_D1, 1);
+   string emaBarDate = TimeToString(emaBarTime, TIME_DATE);
+
    Comment(
       "=== C1: EMA SINGLE TRADE STRATEGY ===\n",
 
       "\n--- EMA SIGNAL ---",
-      "\n50-Day EMA: ", DoubleToString(emaValue, 2),
+      "\n", EMAPeriod, "-Day EMA: ", DoubleToString(emaValue, 2), " (from ", emaBarDate, ")",
       "\n1H Candle Open: ", DoubleToString(h1Open, 2),
+      "\nDifference: ", DoubleToString(h1Open - emaValue, 2),
       "\nSignal: ", signal,
 
       "\n\n--- POSITION ---",
