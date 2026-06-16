@@ -7,14 +7,25 @@
 //|  FEATURES:                                                       |
 //|  - Incremental grid distance (200 * N points)                    |
 //|  - NO hedging                                                    |
-//|  - Trailing stop ONLY (no fixed profit target)                   |
-//|  - Dynamic stop loss based on day profit ($75-$300)              |
-//|  - Dynamic pause time after stop loss (0/30/45/60 mins)          |
+//|  - Dynamic trailing stop based on position count                 |
+//|    (Step = TrailStepBase + (positions-1) * TrailStepMultiplier)  |
+//|    with configurable minimum profit floor                        |
+//|  - LOT-SCALED stop loss parameters (base = 0.1 lot):             |
+//|    * Min SL: $75 base, Max SL: $300 base                         |
+//|    * All values scale by LotSize/0.1 multiplier                  |
+//|  - Dynamic pause time after stop loss (5/30/45/60 mins)          |
 //|  - Daily profit target (stop when reached)                       |
+//|  - LOT-SCALED loss thresholds for target reduction               |
 //|  - Daily loss limit (stop when reached)                          |
 //|  - Market pause buffers (after open / before close)              |
 //|  - Direction ALWAYS switches after every trade                   |
 //|  - 24/7 trading (no day/time filters)                            |
+//|                                                                  |
+//|  SCALING EXAMPLE (0.2 lot = 2x multiplier):                      |
+//|  - Min SL: $150, Max SL: $600                                    |
+//|  - Loss Threshold 1: $400 -> Target $100                         |
+//|  - Loss Threshold 2: $600 -> Target $20                          |
+//|  - Pause tiers: $150/$300/$400/$500                              |
 //|                                                                  |
 //|  XAUUSD MARKET HOURS (UTC+3):                                    |
 //|  - Daily: 01:00 to 00:00 (23 hours)                              |
@@ -41,25 +52,24 @@ input int    GridIncrementStep            = 200;    // Increment per grid level
 //---------------- TRAILING STOP ----------------//
 
 input double GridTrailStart               = 20.0;   // Start trailing at this profit ($)
-input double GridTrailStep                = 10.0;   // Trail by this amount ($)
+input double TrailStepBase                = 10.0;   // Base trail step for 1 position ($)
+input double TrailStepMultiplier          = 9.0;    // Additional step per extra position ($)
+input double MinTrailProfit               = 10.0;   // Minimum profit floor after trailing starts ($)
 
-//---------------- DYNAMIC STOP LOSS ----------------//
-
-input double MinStopLoss                  = 75.0;   // Minimum stop loss ($)
-input double MaxStopLoss                  = 300.0;  // Maximum stop loss ($)
-input double DynamicSLThreshold           = 85.0;   // Day profit threshold for dynamic SL ($)
+//---------------- DYNAMIC STOP LOSS (Auto-scaled by lot size) ----------------//
+// Base values are for 0.1 lot. Actual values = Base × (LotSize / 0.1)
+// MinStopLoss: $75 base, MaxStopLoss: $300 base, SLThreshold: $85 base
+// SL Cushion: $10 base (subtracted from profit for dynamic SL)
 
 //---------------- DAILY LIMITS ----------------//
 
 input double DailyTarget                  = 200.0;  // Stop trading when day profit reaches this ($)
 input double DailyLossLimit               = 500.0;  // Stop trading when day loss reaches this ($)
 
-//---------------- DYNAMIC DAILY TARGET (based on loss) ----------------//
-
-input double LossThreshold1               = 200.0;  // When day loss reaches this, reduce target
-input double ReducedTarget1               = 50.0;   // New target after LossThreshold1 hit
-input double LossThreshold2               = 300.0;  // When day loss reaches this, reduce target further
-input double ReducedTarget2               = 10.0;   // New target after LossThreshold2 hit
+//---------------- DYNAMIC DAILY TARGET (Auto-scaled by lot size) ----------------//
+// Base values for 0.1 lot:
+// LossThreshold1: $200, ReducedTarget1: $50
+// LossThreshold2: $300, ReducedTarget2: $10
 
 //---------------- MARKET PAUSE BUFFERS ----------------//
 
@@ -102,6 +112,105 @@ bool closeAllPending = false;
 bool closeAfterLoss = false;
 double lastStopLossAmount = 0.0;
 double balanceBeforeClose = 0.0;  // Track balance to calculate realized P/L
+
+//+------------------------------------------------------------------+
+//| LOT SIZE MULTIPLIER & SCALED VALUES                              |
+//| Base lot = 0.1, all stop loss parameters scale proportionally    |
+//+------------------------------------------------------------------+
+
+// Base values (for 0.1 lot)
+const double BASE_LOT_SIZE        = 0.1;
+const double BASE_MIN_STOP_LOSS   = 75.0;
+const double BASE_MAX_STOP_LOSS   = 300.0;
+const double BASE_SL_THRESHOLD    = 85.0;
+const double BASE_SL_CUSHION      = 10.0;
+const double BASE_LOSS_THRESHOLD1 = 200.0;
+const double BASE_LOSS_THRESHOLD2 = 300.0;
+const double BASE_REDUCED_TARGET1 = 50.0;
+const double BASE_REDUCED_TARGET2 = 10.0;
+
+// Pause threshold bases (for 0.1 lot)
+const double BASE_PAUSE_TIER1     = 75.0;   // 5 min pause starts
+const double BASE_PAUSE_TIER2     = 150.0;  // 30 min pause starts
+const double BASE_PAUSE_TIER3     = 200.0;  // 45 min pause starts
+const double BASE_PAUSE_TIER4     = 250.0;  // 60 min pause starts
+
+//+------------------------------------------------------------------+
+//| GET LOT MULTIPLIER                                               |
+//+------------------------------------------------------------------+
+double GetLotMultiplier()
+{
+   return LotSize / BASE_LOT_SIZE;
+}
+
+//+------------------------------------------------------------------+
+//| GET SCALED STOP LOSS VALUES                                      |
+//+------------------------------------------------------------------+
+double GetScaledMinStopLoss()
+{
+   return BASE_MIN_STOP_LOSS * GetLotMultiplier();
+}
+
+double GetScaledMaxStopLoss()
+{
+   return BASE_MAX_STOP_LOSS * GetLotMultiplier();
+}
+
+double GetScaledSLThreshold()
+{
+   return BASE_SL_THRESHOLD * GetLotMultiplier();
+}
+
+double GetScaledSLCushion()
+{
+   return BASE_SL_CUSHION * GetLotMultiplier();
+}
+
+//+------------------------------------------------------------------+
+//| GET SCALED LOSS THRESHOLDS & REDUCED TARGETS                     |
+//+------------------------------------------------------------------+
+double GetScaledLossThreshold1()
+{
+   return BASE_LOSS_THRESHOLD1 * GetLotMultiplier();
+}
+
+double GetScaledLossThreshold2()
+{
+   return BASE_LOSS_THRESHOLD2 * GetLotMultiplier();
+}
+
+double GetScaledReducedTarget1()
+{
+   return BASE_REDUCED_TARGET1 * GetLotMultiplier();
+}
+
+double GetScaledReducedTarget2()
+{
+   return BASE_REDUCED_TARGET2 * GetLotMultiplier();
+}
+
+//+------------------------------------------------------------------+
+//| GET SCALED PAUSE THRESHOLDS                                      |
+//+------------------------------------------------------------------+
+double GetScaledPauseTier1()
+{
+   return BASE_PAUSE_TIER1 * GetLotMultiplier();
+}
+
+double GetScaledPauseTier2()
+{
+   return BASE_PAUSE_TIER2 * GetLotMultiplier();
+}
+
+double GetScaledPauseTier3()
+{
+   return BASE_PAUSE_TIER3 * GetLotMultiplier();
+}
+
+double GetScaledPauseTier4()
+{
+   return BASE_PAUSE_TIER4 * GetLotMultiplier();
+}
 
 //+------------------------------------------------------------------+
 //| SAVE DAILY VALUES TO GLOBAL VARIABLES (for input changes)        |
@@ -226,7 +335,8 @@ int OnInit()
          currentDirection = 0;  // Start with BUY
    }
 
-   Print("B10 Initialized: Dynamic SL=$", MinStopLoss, "-$", MaxStopLoss,
+   Print("B10 Initialized: Lot=", LotSize, " (", GetLotMultiplier(), "x multiplier)",
+         " | Dynamic SL=$", GetScaledMinStopLoss(), "-$", GetScaledMaxStopLoss(),
          " | Daily Target=$", DailyTarget, " | Daily Loss Limit=$", DailyLossLimit);
 
    return(INIT_SUCCEEDED);
@@ -295,27 +405,31 @@ void CheckDayReset()
 }
 
 //+------------------------------------------------------------------+
-//| GET CURRENT DYNAMIC STOP LOSS                                    |
+//| GET CURRENT DYNAMIC STOP LOSS (uses scaled values based on lot)  |
 //+------------------------------------------------------------------+
 double GetDynamicStopLoss()
 {
    double stopLoss;
+   double minSL = GetScaledMinStopLoss();
+   double maxSL = GetScaledMaxStopLoss();
+   double slThreshold = GetScaledSLThreshold();
+   double slCushion = GetScaledSLCushion();
 
-   if(dayNetProfit <= DynamicSLThreshold)
+   if(dayNetProfit <= slThreshold)
    {
       // Day profit is at or below threshold - use minimum
-      stopLoss = MinStopLoss;
+      stopLoss = minSL;
    }
    else
    {
       // Day profit above threshold - dynamic calculation
-      stopLoss = dayNetProfit - 10.0;
+      stopLoss = dayNetProfit - slCushion;
 
       // Apply min/max bounds
-      if(stopLoss < MinStopLoss)
-         stopLoss = MinStopLoss;
-      if(stopLoss > MaxStopLoss)
-         stopLoss = MaxStopLoss;
+      if(stopLoss < minSL)
+         stopLoss = minSL;
+      if(stopLoss > maxSL)
+         stopLoss = maxSL;
    }
 
    return stopLoss;
@@ -324,62 +438,108 @@ double GetDynamicStopLoss()
 //+------------------------------------------------------------------+
 //| CHECK AND UPDATE LOSS THRESHOLD FLAGS                            |
 //| Once a threshold is hit, the flag stays true for the rest of day |
+//| Uses scaled thresholds based on lot size                         |
 //+------------------------------------------------------------------+
 void CheckLossThresholds()
 {
+   double lossThreshold1 = GetScaledLossThreshold1();
+   double lossThreshold2 = GetScaledLossThreshold2();
+   double reducedTarget1 = GetScaledReducedTarget1();
+   double reducedTarget2 = GetScaledReducedTarget2();
+
    // Check Level 2 first (higher priority - more severe loss)
    // Once Level 2 is hit, it stays - even if profit recovers
-   if(!targetReducedToLevel2 && dayNetProfit <= -LossThreshold2)
+   if(!targetReducedToLevel2 && dayNetProfit <= -lossThreshold2)
    {
       targetReducedToLevel2 = true;
       targetReducedToLevel1 = true;  // Level 1 is also true if Level 2 is hit
       Print("LOSS THRESHOLD 2 HIT: Day Loss=$", DoubleToString(-dayNetProfit, 2),
-            " >= $", DoubleToString(LossThreshold2, 2),
-            " | Daily Target reduced to $", DoubleToString(ReducedTarget2, 2));
+            " >= $", DoubleToString(lossThreshold2, 2),
+            " | Daily Target reduced to $", DoubleToString(reducedTarget2, 2));
    }
    // Check Level 1 (only if Level 2 not already hit)
-   else if(!targetReducedToLevel1 && dayNetProfit <= -LossThreshold1)
+   else if(!targetReducedToLevel1 && dayNetProfit <= -lossThreshold1)
    {
       targetReducedToLevel1 = true;
       Print("LOSS THRESHOLD 1 HIT: Day Loss=$", DoubleToString(-dayNetProfit, 2),
-            " >= $", DoubleToString(LossThreshold1, 2),
-            " | Daily Target reduced to $", DoubleToString(ReducedTarget1, 2));
+            " >= $", DoubleToString(lossThreshold1, 2),
+            " | Daily Target reduced to $", DoubleToString(reducedTarget1, 2));
    }
 }
 
 //+------------------------------------------------------------------+
 //| GET EFFECTIVE DAILY TARGET                                       |
 //| Returns the current daily target based on loss threshold flags   |
+//| Uses scaled reduced targets based on lot size                    |
 //+------------------------------------------------------------------+
 double GetEffectiveDailyTarget()
 {
    // Level 2 has highest priority (most severe reduction)
    if(targetReducedToLevel2)
-      return ReducedTarget2;
+      return GetScaledReducedTarget2();
 
    // Level 1 next
    if(targetReducedToLevel1)
-      return ReducedTarget1;
+      return GetScaledReducedTarget1();
 
    // No reduction - use input value
    return DailyTarget;
 }
 
 //+------------------------------------------------------------------+
+//| GET DYNAMIC TRAIL STEP BASED ON POSITION COUNT                   |
+//| Formula: TrailStepBase + (positions - 1) * TrailStepMultiplier   |
+//| 1 lot = 10, 2 lots = 19, 3 lots = 28, 4 lots = 37 (with defaults)|
+//+------------------------------------------------------------------+
+double GetDynamicTrailStep()
+{
+   int positions = TotalOurPositions();
+   if(positions <= 0)
+      positions = 1;  // Safety: minimum 1
+
+   double step = TrailStepBase + (positions - 1) * TrailStepMultiplier;
+   return step;
+}
+
+//+------------------------------------------------------------------+
+//| GET TRAIL CLOSE LEVEL (with minimum profit floor)                |
+//| Returns the higher of: (peak - dynamic step) OR minimum floor    |
+//+------------------------------------------------------------------+
+double GetTrailCloseLevel()
+{
+   double dynamicStep = GetDynamicTrailStep();
+   double trailLevel = gridPeakProfit - dynamicStep;
+
+   // Apply minimum profit floor - never close below this after trailing starts
+   if(trailLevel < MinTrailProfit)
+      trailLevel = MinTrailProfit;
+
+   return trailLevel;
+}
+
+//+------------------------------------------------------------------+
 //| GET PAUSE DURATION BASED ON STOP LOSS AMOUNT                     |
+//| Uses scaled thresholds based on lot size                         |
+//| For 0.1 lot: 5min ($75-149), 30min ($150-199), 45min ($200-249), |
+//|              60min ($250-300)                                    |
 //+------------------------------------------------------------------+
 int GetPauseDurationMinutes(double stopLossAmount)
 {
-   if(stopLossAmount < 75.0)
+   double tier1 = GetScaledPauseTier1();  // Base $75
+   double tier2 = GetScaledPauseTier2();  // Base $150
+   double tier3 = GetScaledPauseTier3();  // Base $200
+   double tier4 = GetScaledPauseTier4();  // Base $250
+
+   if(stopLossAmount < tier1)
       return 0;   // No pause (edge case - below minimum SL)
-   else if(stopLossAmount < 150.0)
-      return 5;   // 5 minutes ($75-$149)
-   else if(stopLossAmount < 200.0)
-      return 30;  // 30 minutes ($150-$199)
-   else if(stopLossAmount < 250.0)
-      return 45;  // 45 minutes ($200-$249)
+   else if(stopLossAmount < tier2)
+      return 5;   // 5 minutes
+   else if(stopLossAmount < tier3)
+      return 30;  // 30 minutes
+   else if(stopLossAmount < tier4)
+      return 45;  // 45 minutes
    else
-      return 60;  // 60 minutes ($250-$300)
+      return 60;  // 60 minutes
 }
 
 //+------------------------------------------------------------------+
@@ -785,7 +945,8 @@ void ProcessCloseAll()
          else
          {
             pauseUntil = 0;
-            Print("NO PAUSE: Stop loss $", DoubleToString(lossAmount, 2), " < $75");
+            Print("NO PAUSE: Stop loss $", DoubleToString(lossAmount, 2),
+                  " < $", DoubleToString(GetScaledPauseTier1(), 2));
          }
       }
       else
@@ -904,22 +1065,32 @@ void Dashboard()
    string dailyTargetStatus = IsDailyTargetReached() ? "REACHED!" : "Active";
    string dailyLossStatus = IsDailyLossLimitReached() ? "REACHED!" : "Active";
 
+   // Get scaled values for display
+   double minSL = GetScaledMinStopLoss();
+   double maxSL = GetScaledMaxStopLoss();
+   double slThreshold = GetScaledSLThreshold();
+   double lossThreshold1 = GetScaledLossThreshold1();
+   double lossThreshold2 = GetScaledLossThreshold2();
+   double reducedTarget1 = GetScaledReducedTarget1();
+   double reducedTarget2 = GetScaledReducedTarget2();
+   double lotMultiplier = GetLotMultiplier();
+
    // Target reduction status
    string targetReductionStatus = "Normal";
    if(targetReducedToLevel2)
-      targetReductionStatus = "LEVEL 2 (Loss >= $" + DoubleToString(LossThreshold2, 0) + ")";
+      targetReductionStatus = "LEVEL 2 (Loss >= $" + DoubleToString(lossThreshold2, 0) + ")";
    else if(targetReducedToLevel1)
-      targetReductionStatus = "LEVEL 1 (Loss >= $" + DoubleToString(LossThreshold1, 0) + ")";
+      targetReductionStatus = "LEVEL 1 (Loss >= $" + DoubleToString(lossThreshold1, 0) + ")";
 
    string trailStatus = "Waiting";
-   double trailLevel = 0;
+   double dynamicStep = GetDynamicTrailStep();
+   double trailCloseLevel = GetTrailCloseLevel();
    if(gridPeakProfit >= GridTrailStart)
    {
       trailStatus = "ACTIVE";
-      trailLevel = gridPeakProfit - GridTrailStep;
    }
 
-   string trailLevelStr = (trailStatus == "ACTIVE") ? ("$" + DoubleToString(trailLevel, 2)) : "N/A";
+   string trailLevelStr = (trailStatus == "ACTIVE") ? ("$" + DoubleToString(trailCloseLevel, 2)) : "N/A";
    string threshold1Hit = targetReducedToLevel1 ? " [HIT]" : "";
    string threshold2Hit = targetReducedToLevel2 ? " [HIT]" : "";
 
@@ -927,6 +1098,7 @@ void Dashboard()
    string dash = "=== B10: INCREMENTAL GRID - DYNAMIC STOP LOSS ===\n";
 
    dash += "\n--- GRID STATUS ---";
+   dash += "\nLot Size: " + DoubleToString(LotSize, 2) + " (Multiplier: " + DoubleToString(lotMultiplier, 1) + "x)";
    dash += "\nPositions: " + IntegerToString(gridCount);
    dash += "\nDirection: " + ((currentDirection == 0) ? "BUY" : "SELL");
    dash += "\nNext Distance: " + IntegerToString(GetIncrementalGridDistance()) + " pts";
@@ -935,17 +1107,19 @@ void Dashboard()
    dash += "\nGrid Floating P/L: $" + DoubleToString(gridProfit, 2);
    dash += "\nDay Net Profit: $" + DoubleToString(dayNetProfit, 2);
 
-   dash += "\n\n--- TRAILING STOP ---";
+   dash += "\n\n--- TRAILING STOP (Dynamic) ---";
    dash += "\nPeak Profit: $" + DoubleToString(gridPeakProfit, 2);
    dash += "\nTrail Start: $" + DoubleToString(GridTrailStart, 2);
-   dash += "\nTrail Step: $" + DoubleToString(GridTrailStep, 2);
+   dash += "\nDynamic Step: $" + DoubleToString(dynamicStep, 2) + " (Pos:" + IntegerToString(gridCount) + ")";
+   dash += "\nMin Profit Floor: $" + DoubleToString(MinTrailProfit, 2);
    dash += "\nTrail Status: " + trailStatus;
-   dash += "\nTrail Level: " + trailLevelStr;
+   dash += "\nClose Level: " + trailLevelStr;
 
-   dash += "\n\n--- DYNAMIC STOP LOSS ---";
+   dash += "\n\n--- DYNAMIC STOP LOSS (Scaled) ---";
    dash += "\nCurrent Stop Loss: $" + DoubleToString(currentStopLoss, 2);
-   dash += "\nMin/Max SL: $" + DoubleToString(MinStopLoss, 2) + " / $" + DoubleToString(MaxStopLoss, 2);
-   dash += "\nSL Threshold: $" + DoubleToString(DynamicSLThreshold, 2);
+   dash += "\nMin/Max SL: $" + DoubleToString(minSL, 2) + " / $" + DoubleToString(maxSL, 2);
+   dash += "\nSL Threshold: $" + DoubleToString(slThreshold, 2);
+   dash += "\nSL Cushion: $" + DoubleToString(GetScaledSLCushion(), 2);
 
    dash += "\n\n--- DAILY LIMITS ---";
    dash += "\nOriginal Target: $" + DoubleToString(DailyTarget, 2);
@@ -953,9 +1127,9 @@ void Dashboard()
    dash += "\nTarget Reduction: " + targetReductionStatus;
    dash += "\nDaily Loss Limit: $" + DoubleToString(DailyLossLimit, 2) + " (" + dailyLossStatus + ")";
 
-   dash += "\n\n--- LOSS THRESHOLDS ---";
-   dash += "\nThreshold 1: -$" + DoubleToString(LossThreshold1, 0) + " -> Target $" + DoubleToString(ReducedTarget1, 0) + threshold1Hit;
-   dash += "\nThreshold 2: -$" + DoubleToString(LossThreshold2, 0) + " -> Target $" + DoubleToString(ReducedTarget2, 0) + threshold2Hit;
+   dash += "\n\n--- LOSS THRESHOLDS (Scaled) ---";
+   dash += "\nThreshold 1: -$" + DoubleToString(lossThreshold1, 0) + " -> Target $" + DoubleToString(reducedTarget1, 0) + threshold1Hit;
+   dash += "\nThreshold 2: -$" + DoubleToString(lossThreshold2, 0) + " -> Target $" + DoubleToString(reducedTarget2, 0) + threshold2Hit;
 
    dash += "\n\n--- PAUSE STATUS ---";
    dash += "\nDynamic Pause: " + pauseStatus;
@@ -1026,15 +1200,20 @@ void OnTick()
       }
 
       // CHECK TRAILING STOP (NO fixed profit target)
+      // Uses dynamic trail step based on position count + minimum profit floor
       if(gridPeakProfit >= GridTrailStart)
       {
-         double trailLevel = gridPeakProfit - GridTrailStep;
+         double dynamicStep = GetDynamicTrailStep();
+         double trailCloseLevel = GetTrailCloseLevel();  // Includes min profit floor
 
-         if(gridProfit <= trailLevel)
+         if(gridProfit <= trailCloseLevel)
          {
             Print("TRAILING STOP triggered: Peak=$", gridPeakProfit,
                   " | Current=$", gridProfit,
-                  " | Trail Level=$", trailLevel,
+                  " | Dynamic Step=$", dynamicStep,
+                  " | Positions=", TotalOurPositions(),
+                  " | Close Level=$", trailCloseLevel,
+                  " | Min Floor=$", MinTrailProfit,
                   " | Day Profit Before=$", dayNetProfit);
 
             // Store balance BEFORE closing to calculate realized P/L later
