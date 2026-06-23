@@ -1325,7 +1325,7 @@ Pause durations based on stop loss amount hit. **Thresholds scale with lot size:
 | Stop Loss Hit | Pause Duration |
 |---------------|----------------|
 | < $75 | 0 minutes |
-| $75 - $149 | 5 minutes |
+| $75 - $149 | 15 minutes |
 | $150 - $199 | 30 minutes |
 | $200 - $249 | 45 minutes |
 | $250 - $300 | 60 minutes |
@@ -1334,7 +1334,7 @@ Pause durations based on stop loss amount hit. **Thresholds scale with lot size:
 | Stop Loss Hit | Pause Duration |
 |---------------|----------------|
 | < $150 | 0 minutes |
-| $150 - $299 | 5 minutes |
+| $150 - $299 | 15 minutes |
 | $300 - $399 | 30 minutes |
 | $400 - $499 | 45 minutes |
 | $500 - $600 | 60 minutes |
@@ -1418,7 +1418,7 @@ After **every** completed trade (profit OR loss), direction switches:
 - SELL grid closes → Next grid is BUY
 - No exceptions, regardless of close reason
 
-### B10 Input Parameters (V9 Updated)
+### B10 Input Parameters (V10 Updated)
 
 ```cpp
 //--- GRID SETTINGS ---
@@ -1427,21 +1427,21 @@ input int    MaxTrades                    = 10;
 input int    BaseGridDistance             = 200;    // Points
 input int    GridIncrementStep            = 200;    // Points
 
-//--- TRAILING STOP (V9 - Position-based dynamic step) ---
-input double GridTrailStart               = 20.0;   // Activate at this profit ($)
-input double TrailStepBase                = 10.0;   // Base trail step for 1 position ($)
-input double TrailStepMultiplier          = 9.0;    // Additional step per extra position ($)
-input double MinTrailProfit               = 10.0;   // Minimum profit floor after trailing starts ($)
+//--- TRAILING STOP (V10 - 0 = AUTO-scale, >0 = use as-is) ---
+input double GridTrailStart               = 0;      // 0=auto(20×mult) | else as-is
+input double TrailStepBase                = 0;      // 0=auto(10×mult) | else as-is
+input double TrailStepMultiplier          = 0;      // 0=auto(9×mult)  | else as-is
+input double MinTrailProfit               = 0;      // 0=auto(10×mult) | else as-is
 
-//--- DYNAMIC STOP LOSS (V9 - Auto-scaled by lot size) ---
+//--- DYNAMIC STOP LOSS (Auto-scaled by lot size) ---
 // Base values (for 0.1 lot): MinSL=$75, MaxSL=$300, Threshold=$85, Cushion=$10
 // Actual values = Base × (LotSize / 0.1)
 
-//--- DAILY LIMITS ---
-input double DailyTarget                  = 200.0;  // Stop when reached ($) - NOT scaled
-input double DailyLossLimit               = 500.0;  // Stop when loss reaches this ($) - NOT scaled
+//--- DAILY LIMITS (V10 - 0 = AUTO-scale, >0 = use as-is) ---
+input double DailyTarget                  = 0;      // 0=auto(200×mult) | else as-is
+input double DailyLossLimit               = 0;      // 0=auto(500×mult) | else as-is
 
-//--- DYNAMIC DAILY TARGET (V9 - Auto-scaled by lot size) ---
+//--- DYNAMIC DAILY TARGET (Auto-scaled by lot size) ---
 // Base values (for 0.1 lot):
 // LossThreshold1=$200 -> ReducedTarget1=$50
 // LossThreshold2=$300 -> ReducedTarget2=$10
@@ -1458,8 +1458,16 @@ input ulong  Slippage                     = 30;     // Max price deviation in po
 
 **Notes:**
 - B10 uses `SetTypeFillingBySymbol()` for automatic broker compatibility
-- Stop loss parameters auto-scale based on `LotSize / 0.1` multiplier
-- DailyTarget and DailyLossLimit are manual inputs (NOT scaled)
+- **V10: Sentinel-zero auto-scaling** — for the trailing params and daily limits,
+  an input of **`0` means AUTO** (base value × `LotSize/0.1` multiplier); any value
+  **`> 0` is used exactly as entered**, with no further multiplication.
+- This means **`LotSize` is normally the only value you set** — leave the 6 scalable
+  params at `0` and they auto-scale. Two accounts (e.g. 0.1 and 0.3 lot) then trade
+  in perfect lockstep: same entries, same exits, same price points — just N× dollars.
+- Stop loss params and loss thresholds / reduced targets are **always** auto-scaled
+  (no override input — they have no `input` declaration).
+- The lot multiplier is rounded to 2 decimals so `0.3/0.1` = exactly `3.00`
+  (avoids the `2.9999996` floating-point error at trigger boundaries).
 
 #### 8. Lot-Scaled Dynamic Daily Target (V9 Updated)
 
@@ -1744,9 +1752,9 @@ Next day: Ready for new trade based on EMA signal
     - **Dynamic Stop Loss**: Adjusts from $75-$300 based on day profit
       - If dayProfit <= $85: Use minimum $75
       - If dayProfit > $85: Use (dayProfit - $10), capped at $300
-    - **Dynamic Pause After Stop Loss**: 0/5/30/45/60 minutes based on loss size
+    - **Dynamic Pause After Stop Loss**: 0/15/30/45/60 minutes based on loss size
       - < $75: No pause (edge case)
-      - $75-$149: 5 minutes
+      - $75-$149: 15 minutes (V10: was 5 minutes)
       - $150-$199: 30 minutes
       - $200-$249: 45 minutes
       - $250-$300: 60 minutes
@@ -1775,7 +1783,23 @@ Next day: Ready for new trade based on EMA signal
     - Profit exit: Trailing stop only
     - Auto-close before market close
   - 18 total strategy variations available
-- **v9 (Current)**: B10 enhancements + C1 EMA fix
+- **v10 (Current)**: B10 sentinel-zero auto-scaling + pause + float fix
+  - **SENTINEL-ZERO AUTO-SCALING (B10)**: 6 params now default to `0` = AUTO
+    - Affected: `GridTrailStart`, `TrailStepBase`, `TrailStepMultiplier`,
+      `MinTrailProfit`, `DailyTarget`, `DailyLossLimit`
+    - Input `0` → base value × (`LotSize`/0.1) multiplier
+    - Input `> 0` → use the entered value exactly, no further scaling
+    - **Why**: Previously `DailyTarget`/`DailyLossLimit` were NOT scaled and the
+      trailing params had to be scaled by hand. Two accounts on different lot sizes
+      (e.g. 0.1 vs 0.3) desynced — the larger lot hit the un-scaled $200 target /
+      $500 loss limit after only 1/N the price move, then stopped trading while the
+      other kept going. Now, with all 6 at `0`, both accounts trade in lockstep.
+  - **FLOAT-PRECISION FIX (B10)**: `GetLotMultiplier()` rounds to 2 decimals
+    - `0.3 / 0.1` now returns exactly `3.00` instead of `2.9999996`
+    - Prevents the two accounts flipping a trigger a tick apart at boundaries
+  - **PAUSE DURATION UPDATE (B10)**: $75–$149 stop-loss tier now pauses **15 min**
+    (was 5 min). Tier still scales with lot size.
+- **v9**: B10 enhancements + C1 EMA fix
   - **B10 LOT-SCALED PARAMETERS**: All stop loss parameters now auto-scale based on lot size
     - Multiplier formula: `LotSize / 0.1`
     - Base values (for 0.1 lot): MinSL=$75, MaxSL=$300, SLThreshold=$85, SLCushion=$10
