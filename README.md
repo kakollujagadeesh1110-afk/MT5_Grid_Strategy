@@ -15,6 +15,7 @@ Each file follows the pattern: `{Series}{Number}_{strategy-type}_{features}.mq5`
 | **A** | Fixed Grid Distance (200 points always) |
 | **B** | Incremental Grid Distance (200 × N pattern) |
 | **C** | EMA-based Single Trade strategies |
+| **D** | Backtest-derived "winner" config (B10 engine + incremental lots + geometric stop) |
 | **1-2** | No Hedge strategies |
 | **3-7** | With Hedge strategies |
 | **8-9** | Time-filtered versions (trades only during optimal hours) |
@@ -55,6 +56,23 @@ Each file follows the pattern: `{Series}{Number}_{strategy-type}_{features}.mq5`
 | File | Strategy | Entry Signal | Hedge | Trailing | Stop Loss |
 |------|----------|--------------|-------|----------|-----------|
 | **C1_ema_single_trade** | Single Trade | 1H Open vs N-day EMA (D1, completed bar) | No | Yes | 60% of investment |
+
+### D-Series: Backtest-Derived "Winner" Config
+
+| File | Grid Type | Lots | Max Levels | Stop Loss | Trailing | Notes |
+|------|-----------|------|------------|-----------|----------|-------|
+| **D1_incr300_2lvl_geostop** | Incremental 300/300 | Incremental (1,2 → 3-lot basket) | 2 | Geometric: 5pts before the 3rd set once full; dynamic $ SL while filling | Yes | The `incrLOT_300_2lvl` config from the 32-day backtest research |
+
+**NEW:** D1 is the **`incrLOT_300_2lvl`** strategy from the backtest research, ported 1:1 from the Python
+simulator (`bt_b10_sim.py`). It is the B10 engine (trailing exit, daily limits, auto-scaling, 24/7,
+direction-always-switches) with **two added features**: (1) **incremental lots** — grid level k opens
+(k+1) lots, so a full 2-level basket holds 3 lots (0.3 effective at 0.1 base); and (2) a **geometric
+"stop before next set"** — once the basket is full the stop sits 5 points before where a 3rd set would
+open, instead of the dynamic dollar SL. Defaults ARE the analyzed config (Lot 0.1, 300/300, MaxTrades 2,
+IncrementalLots=true, StopBeforeNextPts=5). Backtest character: median ~+$200/day, ~93% win rate, but a
+"win small / lose big" tail (~28% of random starts hit a −$700..−$920 basket). See `PERDAY_ANALYSIS.md`
+and `PROJECT_HISTORY.md`. **Not a proven profit engine — forward-validate on demo before sizing up.**
+Set `IncrementalLots=false` for the smaller-tail `flatLOT_300_2lvl` variant from the same file.
 
 **NEW (V8):** B10 includes **dynamic stop loss**, **daily limits**, and **24/7 trading** - see section below.
 
