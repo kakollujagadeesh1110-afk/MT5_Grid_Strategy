@@ -74,6 +74,48 @@ IncrementalLots=true, StopBeforeNextPts=5). Backtest character: median ~+$200/da
 and `PROJECT_HISTORY.md`. **Not a proven profit engine — forward-validate on demo before sizing up.**
 Set `IncrementalLots=false` for the smaller-tail `flatLOT_300_2lvl` variant from the same file.
 
+#### D1 Recommended Input Values
+
+The shipped defaults **already are** the analyzed config — the only value you must decide is `LotSize`.
+**Leave every dollar input at `0`** so it auto-scales off `LotSize/0.1` exactly as the backtest simulated
+(entering a value > 0 uses it as-is and breaks the scaling — this was the original "demo accounts
+desynced" bug).
+
+| Input | Value | Why |
+|-------|-------|-----|
+| `LotSize` | **0.1** (backtest baseline; this is the one real decision — see sizing below) | The only risk choice |
+| `MaxTrades` | **2** | Defines the 2-level / 3-lot basket |
+| `BaseGridDistance` | **300** | The "300" in incrLOT_300_2lvl |
+| `GridIncrementStep` | **300** | Incremental spacing |
+| `IncrementalLots` | **true** | "incrLOT": level 0 = 1 lot, level 1 = 2 lots |
+| `StopBeforeNextPts` | **5** | Geometric stop, 5 pts before the 3rd set |
+| `GridTrailStart` | **0** | 0 = auto ($20 at 0.1 lot) |
+| `TrailStepBase` | **0** | 0 = auto ($10) |
+| `TrailStepMultiplier` | **0** | 0 = auto ($9) |
+| `MinTrailProfit` | **0** | 0 = auto ($10) |
+| `DailyTarget` | **0** | 0 = auto ($200 at 0.1) |
+| `DailyLossLimit` | **0** | 0 = auto ($500 at 0.1) — see circuit-breaker tweak below |
+| `PauseMinutesAfterMarketOpen` | **0** | Backtest was 24/7, no time filter |
+| `PauseMinutesBeforeMarketClose` | **0** | Same |
+| `MagicNumber` | **100301** | Keep distinct from B10 (101010) |
+| `Slippage` | **30** | As-is |
+
+**Sizing — `LotSize` is a risk choice, not a profit choice.** Everything scales linearly, including the
+loss tail. Size for the bad-basket day, not the median:
+
+| LotSize | Effective basket | Median/day | Worst-basket tail |
+|---------|------------------|------------|-------------------|
+| 0.01 | 0.03 | ~+$20 | ~−$90 |
+| **0.1** | 0.3 | ~+$200 | **~−$920** |
+| 0.3 | 0.9 | ~+$600 | ~−$2,760 |
+
+**Optional safety tweaks (not in the backtest):**
+- **Circuit breaker:** lower `DailyLossLimit` (e.g. `300` at 0.1 lot) to halt the day after ~one bad
+  basket instead of riding to the $500 default — directly truncates the worst-start tail from
+  `PERDAY_ANALYSIS.md`.
+- **Smaller tail:** set `IncrementalLots=false` for `flatLOT_300_2lvl` — nearly the same median, smaller
+  tail (~−$869 vs −$921); best risk-adjusted of the two.
+
 **NEW (V8):** B10 includes **dynamic stop loss**, **daily limits**, and **24/7 trading** - see section below.
 
 **NEW (V8):** C1 is an **EMA-based single trade strategy** - see section below.
