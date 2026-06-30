@@ -1,0 +1,906 @@
+//+------------------------------------------------------------------+
+//|                                  D2_double001_abs75_trail.mq5     |
+//|                                                                  |
+//|  STRATEGY: small-stake, hard-capped "many small wins" grid       |
+//|                                                                  |
+//|  Goal: keep the per-basket loss SMALL and FIXED (-$75) and let   |
+//|  many tiny trailing wins accumulate. Designed after D1's -$900   |
+//|  tail was judged too large.                                      |
+//|                                                                  |
+//|  This is the B10 engine (trailing-only exit, daily limits, 24/7, |
+//|  direction-always-switches) with THREE changes vs D1, all ported |
+//|  1:1 from the Python simulator (bt_b10_sim.py):                  |
+//|                                                                  |
+//|   1. DOUBLING LOTS  (LotMode = LOT_DOUBLING)                     |
+//|      Grid set k opens 2^k x LotSize: 0.01, 0.02, 0.04, ...       |
+//|                                                                  |
+//|   2. ABSOLUTE $ STOP  (FixedStopLossAbs = 75, NOT lot-scaled)   |
+//|      The whole basket closes the instant unrealized P/L <= -$75. |
+//|      This is the hard downside cap regardless of lot/sets.       |
+//|                                                                  |
+//|   3. GRID base=0 / incr=300                                     |
+//|      Sets at 0, -300, -900, -1800, ... (gaps grow 300,600,900). |
+//|                                                                  |
+//|  DETERMINISTIC GEOMETRY (computed, bt_d2_design.py):            |
+//|    With 0.01 doubling + $75 abs stop + base0/incr300:           |
+//|    EXACTLY 3 SETS open (0.01/0.02/0.04 at 0/-300/-900 pts).     |
+//|    The $75 stop triggers ~1671 pts (~$16.71) from the 1st entry, |
+//|    holding 0.07 lots. A 4th set (-1800 pts) would imply a $84    |
+//|    loss > $75, so it never opens.                               |
+//|                                                                  |
+//|  TRAILING (optimized over 32 days, bt_d2_design.py):           |
+//|    GridTrailStart=4.0, TrailStepBase=0.5 gave the best          |
+//|    expectancy: mean ~$0/day (breakeven), ~75% win rate, median   |
+//|    ~+$21/day, worst day ~-$85. Holds in-sample (May) AND         |
+//|    out-of-sample (June). These are the DEFAULTS below.          |
+//|                                                                  |
+//|  HONEST NOTE: even optimized the MEAN is ~breakeven, not        |
+//|  strongly positive. This is a RISK-CONTROLLED small-stake        |
+//|  config (capped -$75 loss), not a proven profit engine.         |
+//|  Forward-validate on demo before sizing up.                     |
+//|                                                                  |
+//|  XAUUSD MARKET HOURS (UTC+3): daily 01:00-00:00 ; maintenance   |
+//|  00:00-01:00 ; weekend Sat 01:00 -> Mon 01:00 closed.           |
+//+------------------------------------------------------------------+
+#property copyright "D2 Strategy (double 0.01 / abs $75 stop)"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| ENUMS                                                            |
+//+------------------------------------------------------------------+
+enum ENUM_LOT_MODE
+{
+   LOT_FLAT        = 0,   // every set = 1 x LotSize
+   LOT_INCREMENTAL = 1,   // set k = (k+1) x LotSize  (1,2,3,...)  <- D1 style
+   LOT_DOUBLING    = 2    // set k = 2^k  x LotSize  (1,2,4,8,...) <- D2 default
+};
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                 |
+//+------------------------------------------------------------------+
+
+//---------------- GRID SETTINGS ----------------//
+
+input double         LotSize             = 0.01;          // Base lot (set 0 = 1 x this)
+input int            MaxTrades           = 4;             // Safety cap on sets; the $75 stop is the REAL limiter (->3 sets)
+input int            BaseGridDistance    = 0;             // Base distance in points (0 -> first gap = 1xIncrement)
+input int            GridIncrementStep   = 300;           // Increment per grid level
+input ENUM_LOT_MODE  LotMode             = LOT_DOUBLING;  // Lot progression across sets
+
+//---------------- STOP LOSS ----------------//
+
+input double FixedStopLossAbs            = 75.0;   // ABSOLUTE $ per-basket stop (NOT lot-scaled). 0 = use dynamic B10 SL.
+
+//---------------- TRAILING STOP (optimized defaults; >0 = use as-is, 0 = auto-scale) ----------------//
+
+input double GridTrailStart              = 4.0;    // Start trailing once basket profit reaches this ($). Swept best.
+input double TrailStepBase               = 0.5;    // Base trail give-back for 1 position ($). Swept best.
+input double TrailStepMultiplier         = 0.45;   // Extra give-back per added set ($) = step*0.9, as swept.
+input double MinTrailProfit              = 1.0;    // Minimum locked profit floor once trailing active ($).
+
+//---------------- DAILY LIMITS (0 = auto-scale by lot) ----------------//
+
+input double DailyTarget                 = 0;      // 0=auto(200xmult). At 0.01 lot -> $20.
+input double DailyLossLimit              = 0;      // 0=auto(500xmult). At 0.01 lot -> $50. Acts as circuit breaker.
+
+//---------------- MARKET PAUSE BUFFERS ----------------//
+
+input int    PauseMinutesAfterMarketOpen  = 0;
+input int    PauseMinutesBeforeMarketClose = 0;
+
+//---------------- SAFETY ----------------//
+
+input ulong  MagicNumber                  = 100302;  // distinct from B10 (101010) and D1 (100301)
+input ulong  Slippage                     = 30;
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                 |
+//+------------------------------------------------------------------+
+
+CTrade trade;
+
+int currentDirection = -1;  // -1 = not set, 0 = BUY, 1 = SELL
+
+double gridPeakProfit = 0.0;
+
+double dayNetProfit = 0.0;
+int lastDayOfYear = -1;
+bool dailyTargetReachedToday = false;
+bool dailyLossLimitReachedToday = false;
+
+bool targetReducedToLevel1 = false;
+bool targetReducedToLevel2 = false;
+
+string gvPrefix = "D2_";   // independent of B10_ / D1_
+
+datetime pauseUntil = 0;
+
+bool closeAllPending = false;
+bool closeAfterLoss = false;
+double lastStopLossAmount = 0.0;
+double balanceBeforeClose = 0.0;
+
+//+------------------------------------------------------------------+
+//| BASE VALUES (for 0.1 lot)                                        |
+//+------------------------------------------------------------------+
+const double BASE_LOT_SIZE        = 0.1;
+const double BASE_MIN_STOP_LOSS   = 75.0;
+const double BASE_MAX_STOP_LOSS   = 300.0;
+const double BASE_SL_THRESHOLD    = 85.0;
+const double BASE_SL_CUSHION      = 10.0;
+const double BASE_LOSS_THRESHOLD1 = 200.0;
+const double BASE_LOSS_THRESHOLD2 = 300.0;
+const double BASE_REDUCED_TARGET1 = 50.0;
+const double BASE_REDUCED_TARGET2 = 10.0;
+
+const double BASE_PAUSE_TIER1     = 75.0;
+const double BASE_PAUSE_TIER2     = 150.0;
+const double BASE_PAUSE_TIER3     = 200.0;
+const double BASE_PAUSE_TIER4     = 250.0;
+
+const double BASE_GRID_TRAIL_START      = 20.0;
+const double BASE_TRAIL_STEP_BASE       = 10.0;
+const double BASE_TRAIL_STEP_MULTIPLIER = 9.0;
+const double BASE_MIN_TRAIL_PROFIT      = 10.0;
+const double BASE_DAILY_TARGET          = 200.0;
+const double BASE_DAILY_LOSS_LIMIT      = 500.0;
+
+//+------------------------------------------------------------------+
+//| LOT MULTIPLIER / PARAM RESOLUTION                                |
+//+------------------------------------------------------------------+
+double GetLotMultiplier()
+{
+   double mult = LotSize / BASE_LOT_SIZE;
+   return MathRound(mult * 100.0) / 100.0;
+}
+
+double ResolveParam(double inputValue, double baseValue)
+{
+   if(inputValue > 0)
+      return inputValue;
+   return baseValue * GetLotMultiplier();
+}
+
+//+------------------------------------------------------------------+
+//| SCALED GETTERS                                                   |
+//+------------------------------------------------------------------+
+double GetScaledMinStopLoss()    { return BASE_MIN_STOP_LOSS   * GetLotMultiplier(); }
+double GetScaledMaxStopLoss()    { return BASE_MAX_STOP_LOSS   * GetLotMultiplier(); }
+double GetScaledSLThreshold()    { return BASE_SL_THRESHOLD    * GetLotMultiplier(); }
+double GetScaledSLCushion()      { return BASE_SL_CUSHION      * GetLotMultiplier(); }
+double GetScaledLossThreshold1() { return BASE_LOSS_THRESHOLD1 * GetLotMultiplier(); }
+double GetScaledLossThreshold2() { return BASE_LOSS_THRESHOLD2 * GetLotMultiplier(); }
+double GetScaledReducedTarget1() { return BASE_REDUCED_TARGET1 * GetLotMultiplier(); }
+double GetScaledReducedTarget2() { return BASE_REDUCED_TARGET2 * GetLotMultiplier(); }
+double GetScaledPauseTier1()     { return BASE_PAUSE_TIER1     * GetLotMultiplier(); }
+double GetScaledPauseTier2()     { return BASE_PAUSE_TIER2     * GetLotMultiplier(); }
+double GetScaledPauseTier3()     { return BASE_PAUSE_TIER3     * GetLotMultiplier(); }
+double GetScaledPauseTier4()     { return BASE_PAUSE_TIER4     * GetLotMultiplier(); }
+
+double GetGridTrailStart()      { return ResolveParam(GridTrailStart,      BASE_GRID_TRAIL_START); }
+double GetTrailStepBase()       { return ResolveParam(TrailStepBase,       BASE_TRAIL_STEP_BASE); }
+double GetTrailStepMultiplier() { return ResolveParam(TrailStepMultiplier, BASE_TRAIL_STEP_MULTIPLIER); }
+double GetMinTrailProfit()      { return ResolveParam(MinTrailProfit,      BASE_MIN_TRAIL_PROFIT); }
+double GetDailyTarget()         { return ResolveParam(DailyTarget,         BASE_DAILY_TARGET); }
+double GetDailyLossLimit()      { return ResolveParam(DailyLossLimit,      BASE_DAILY_LOSS_LIMIT); }
+
+//+------------------------------------------------------------------+
+//| GV PERSISTENCE                                                   |
+//+------------------------------------------------------------------+
+void SaveDailyValuesToGV()
+{
+   GlobalVariableSet(gvPrefix + "dayNetProfit", dayNetProfit);
+   GlobalVariableSet(gvPrefix + "lastDayOfYear", (double)lastDayOfYear);
+   GlobalVariableSet(gvPrefix + "dailyTargetReached", dailyTargetReachedToday ? 1.0 : 0.0);
+   GlobalVariableSet(gvPrefix + "dailyLossLimitReached", dailyLossLimitReachedToday ? 1.0 : 0.0);
+   GlobalVariableSet(gvPrefix + "currentDirection", (double)currentDirection);
+   GlobalVariableSet(gvPrefix + "pauseUntil", (double)pauseUntil);
+   GlobalVariableSet(gvPrefix + "targetReducedLevel1", targetReducedToLevel1 ? 1.0 : 0.0);
+   GlobalVariableSet(gvPrefix + "targetReducedLevel2", targetReducedToLevel2 ? 1.0 : 0.0);
+   Print("D2 daily values SAVED to GlobalVariables");
+}
+
+bool RestoreDailyValuesFromGV()
+{
+   if(!GlobalVariableCheck(gvPrefix + "lastDayOfYear"))
+      return false;
+
+   int storedDay = (int)GlobalVariableGet(gvPrefix + "lastDayOfYear");
+
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(storedDay != dt.day_of_year)
+   {
+      GlobalVariableDel(gvPrefix + "dayNetProfit");
+      GlobalVariableDel(gvPrefix + "lastDayOfYear");
+      GlobalVariableDel(gvPrefix + "dailyTargetReached");
+      GlobalVariableDel(gvPrefix + "dailyLossLimitReached");
+      GlobalVariableDel(gvPrefix + "currentDirection");
+      GlobalVariableDel(gvPrefix + "pauseUntil");
+      GlobalVariableDel(gvPrefix + "targetReducedLevel1");
+      GlobalVariableDel(gvPrefix + "targetReducedLevel2");
+      return false;
+   }
+
+   dayNetProfit = GlobalVariableGet(gvPrefix + "dayNetProfit");
+   lastDayOfYear = storedDay;
+   dailyTargetReachedToday = (GlobalVariableGet(gvPrefix + "dailyTargetReached") == 1.0);
+   dailyLossLimitReachedToday = (GlobalVariableGet(gvPrefix + "dailyLossLimitReached") == 1.0);
+   currentDirection = (int)GlobalVariableGet(gvPrefix + "currentDirection");
+   pauseUntil = (datetime)GlobalVariableGet(gvPrefix + "pauseUntil");
+   targetReducedToLevel1 = (GlobalVariableGet(gvPrefix + "targetReducedLevel1") == 1.0);
+   targetReducedToLevel2 = (GlobalVariableGet(gvPrefix + "targetReducedLevel2") == 1.0);
+
+   GlobalVariableDel(gvPrefix + "dayNetProfit");
+   GlobalVariableDel(gvPrefix + "lastDayOfYear");
+   GlobalVariableDel(gvPrefix + "dailyTargetReached");
+   GlobalVariableDel(gvPrefix + "dailyLossLimitReached");
+   GlobalVariableDel(gvPrefix + "currentDirection");
+   GlobalVariableDel(gvPrefix + "pauseUntil");
+   GlobalVariableDel(gvPrefix + "targetReducedLevel1");
+   GlobalVariableDel(gvPrefix + "targetReducedLevel2");
+
+   Print("D2 daily values RESTORED | dayNetProfit=$", DoubleToString(dayNetProfit, 2));
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| INIT / DEINIT                                                    |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   bool restored = RestoreDailyValuesFromGV();
+
+   if(!restored)
+   {
+      MqlDateTime dt;
+      TimeCurrent(dt);
+
+      if(lastDayOfYear == dt.day_of_year && lastDayOfYear != -1)
+      {
+         Print("D2 Reinit (same day): keeping dayNetProfit=$", DoubleToString(dayNetProfit, 2));
+      }
+      else
+      {
+         lastDayOfYear = dt.day_of_year;
+         dayNetProfit = 0.0;
+         dailyTargetReachedToday = false;
+         dailyLossLimitReachedToday = false;
+         targetReducedToLevel1 = false;
+         targetReducedToLevel2 = false;
+         Print("D2 Fresh Start: day tracking initialized");
+      }
+
+      if(currentDirection == -1)
+         currentDirection = 0;  // start BUY
+   }
+
+   string lm = (LotMode == LOT_DOUBLING) ? "DOUBLING" : (LotMode == LOT_INCREMENTAL ? "INCR" : "FLAT");
+   Print("D2 Initialized: Lot=", LotSize, " (", GetLotMultiplier(), "x) | LotMode=", lm,
+         " | Grid=", BaseGridDistance, "/", GridIncrementStep,
+         " | AbsStop=$", FixedStopLossAbs,
+         " | Trail start=$", GetGridTrailStart(), " step=$", GetTrailStepBase(),
+         " | Daily Target=$", GetDailyTarget(), " Loss=$", GetDailyLossLimit());
+
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   if(reason == REASON_PARAMETERS ||
+      reason == REASON_CHARTCHANGE ||
+      reason == REASON_TEMPLATE ||
+      reason == REASON_RECOMPILE)
+   {
+      SaveDailyValuesToGV();
+      Print("D2 OnDeinit: Reason=", reason, " - daily values saved for restore");
+   }
+   else
+   {
+      Print("D2 OnDeinit: Reason=", reason, " - fresh start on next init");
+   }
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+//| NEW DAY RESET                                                    |
+//+------------------------------------------------------------------+
+void CheckDayReset()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(dt.day_of_year != lastDayOfYear)
+   {
+      Print("D2 NEW DAY RESET: prev dayNetProfit=$", DoubleToString(dayNetProfit, 2));
+      dayNetProfit = 0.0;
+      dailyTargetReachedToday = false;
+      dailyLossLimitReachedToday = false;
+      targetReducedToLevel1 = false;
+      targetReducedToLevel2 = false;
+      lastDayOfYear = dt.day_of_year;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ACTIVE STOP LOSS ($)                                             |
+//| D2: absolute fixed stop (NOT lot-scaled) when FixedStopLossAbs>0;|
+//| else fall back to B10 dynamic SL. Ported from bt_b10_sim.dyn_sl()|
+//+------------------------------------------------------------------+
+double GetActiveStopLoss()
+{
+   if(FixedStopLossAbs > 0)
+      return FixedStopLossAbs;   // hard absolute cap
+
+   // dynamic B10 SL (only if absolute stop disabled)
+   double minSL = GetScaledMinStopLoss();
+   double maxSL = GetScaledMaxStopLoss();
+   double slThreshold = GetScaledSLThreshold();
+   double slCushion = GetScaledSLCushion();
+
+   double stopLoss;
+   if(dayNetProfit <= slThreshold)
+      stopLoss = minSL;
+   else
+   {
+      stopLoss = dayNetProfit - slCushion;
+      if(stopLoss < minSL) stopLoss = minSL;
+      if(stopLoss > maxSL) stopLoss = maxSL;
+   }
+   return stopLoss;
+}
+
+//+------------------------------------------------------------------+
+//| LOSS THRESHOLD FLAGS / EFFECTIVE TARGET                          |
+//+------------------------------------------------------------------+
+void CheckLossThresholds()
+{
+   double lossThreshold1 = GetScaledLossThreshold1();
+   double lossThreshold2 = GetScaledLossThreshold2();
+
+   if(!targetReducedToLevel2 && dayNetProfit <= -lossThreshold2)
+   {
+      targetReducedToLevel2 = true;
+      targetReducedToLevel1 = true;
+      Print("D2 LOSS THRESHOLD 2 HIT: day=$", DoubleToString(dayNetProfit, 2));
+   }
+   else if(!targetReducedToLevel1 && dayNetProfit <= -lossThreshold1)
+   {
+      targetReducedToLevel1 = true;
+      Print("D2 LOSS THRESHOLD 1 HIT: day=$", DoubleToString(dayNetProfit, 2));
+   }
+}
+
+double GetEffectiveDailyTarget()
+{
+   if(targetReducedToLevel2) return GetScaledReducedTarget2();
+   if(targetReducedToLevel1) return GetScaledReducedTarget1();
+   return GetDailyTarget();
+}
+
+//+------------------------------------------------------------------+
+//| TRAILING                                                         |
+//+------------------------------------------------------------------+
+double GetDynamicTrailStep()
+{
+   int positions = TotalOurPositions();
+   if(positions <= 0) positions = 1;
+   return GetTrailStepBase() + (positions - 1) * GetTrailStepMultiplier();
+}
+
+double GetTrailCloseLevel()
+{
+   double trailLevel = gridPeakProfit - GetDynamicTrailStep();
+   double minFloor = GetMinTrailProfit();
+   if(trailLevel < minFloor) trailLevel = minFloor;
+   return trailLevel;
+}
+
+//+------------------------------------------------------------------+
+//| PAUSE DURATION FROM STOP-LOSS AMOUNT                             |
+//+------------------------------------------------------------------+
+int GetPauseDurationMinutes(double stopLossAmount)
+{
+   double tier1 = GetScaledPauseTier1();
+   double tier2 = GetScaledPauseTier2();
+   double tier3 = GetScaledPauseTier3();
+   double tier4 = GetScaledPauseTier4();
+
+   if(stopLossAmount < tier1) return 0;
+   else if(stopLossAmount < tier2) return 15;
+   else if(stopLossAmount < tier3) return 30;
+   else if(stopLossAmount < tier4) return 45;
+   else return 60;
+}
+
+//+------------------------------------------------------------------+
+//| MARKET HOURS / BUFFERS                                           |
+//+------------------------------------------------------------------+
+bool IsMarketOpen()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(dt.day_of_week == 0) return false;       // Sunday
+   if(dt.day_of_week == 6) return (dt.hour < 1);// Saturday: open only 00:00-00:59
+   if(dt.hour == 0) return false;              // weekday maintenance hour
+   return true;
+}
+
+bool IsInMarketPauseBuffer()
+{
+   if(PauseMinutesAfterMarketOpen == 0 && PauseMinutesBeforeMarketClose == 0)
+      return false;
+
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(dt.day_of_week == 0 || (dt.day_of_week == 6 && dt.hour >= 1))
+      return false;
+
+   int currentMinuteOfDay = dt.hour * 60 + dt.min;
+   int marketOpenMinute = 1 * 60;
+   int marketCloseMinute = 24 * 60;
+
+   if(PauseMinutesAfterMarketOpen > 0)
+   {
+      int pauseEndMinute = marketOpenMinute + PauseMinutesAfterMarketOpen;
+      if(currentMinuteOfDay >= marketOpenMinute && currentMinuteOfDay < pauseEndMinute)
+         return true;
+   }
+   if(PauseMinutesBeforeMarketClose > 0)
+   {
+      int pauseStartMinute = marketCloseMinute - PauseMinutesBeforeMarketClose;
+      if(currentMinuteOfDay >= pauseStartMinute)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| DAILY TARGET / LOSS LIMIT / GATE                                 |
+//+------------------------------------------------------------------+
+bool IsDailyTargetReached()
+{
+   if(dailyTargetReachedToday) return true;
+   double effectiveTarget = GetEffectiveDailyTarget();
+   if(dayNetProfit >= effectiveTarget)
+   {
+      dailyTargetReachedToday = true;
+      Print("D2 DAILY TARGET REACHED: $", DoubleToString(dayNetProfit, 2));
+      return true;
+   }
+   return false;
+}
+
+bool IsDailyLossLimitReached()
+{
+   if(dailyLossLimitReachedToday) return true;
+   double lossLimit = GetDailyLossLimit();
+   if(dayNetProfit <= -lossLimit)
+   {
+      dailyLossLimitReachedToday = true;
+      Print("D2 DAILY LOSS LIMIT REACHED: $", DoubleToString(dayNetProfit, 2));
+      return true;
+   }
+   return false;
+}
+
+bool CanOpenNewTrades()
+{
+   if(!IsMarketOpen()) return false;
+   if(IsInMarketPauseBuffer()) return false;
+   if(pauseUntil > 0 && TimeCurrent() < pauseUntil) return false;
+   if(IsDailyTargetReached()) return false;
+   if(IsDailyLossLimitReached()) return false;
+   return true;
+}
+
+bool AllowTrading()
+{
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return false;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) return false;
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT)) return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| LOT HELPERS                                                      |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathMax(minLot, lot);
+   lot = MathMin(maxLot, lot);
+   lot = MathRound(lot / lotStep) * lotStep;
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| LOT FOR THE NEXT SET (matches bt_b10_sim.next_lots())            |
+//|   DOUBLING:    set k -> 2^k x LotSize  (1,2,4,8,...)            |
+//|   INCREMENTAL: set k -> (k+1) x LotSize (1,2,3,...)            |
+//|   FLAT:        always 1 x LotSize                              |
+//+------------------------------------------------------------------+
+double GetNextLot(int currentCount)
+{
+   double units;
+   if(LotMode == LOT_DOUBLING)
+      units = MathPow(2.0, currentCount);
+   else if(LotMode == LOT_INCREMENTAL)
+      units = currentCount + 1;
+   else
+      units = 1;
+   return NormalizeLot(units * LotSize);
+}
+
+//+------------------------------------------------------------------+
+//| POSITION COUNTING / METRICS                                      |
+//+------------------------------------------------------------------+
+int TotalOurPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+            count++;
+      }
+   }
+   return count;
+}
+
+int CountGridPositions(ENUM_POSITION_TYPE type)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == type)
+            count++;
+      }
+   }
+   return count;
+}
+
+double GetGridProfit()
+{
+   double profit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            profit += PositionGetDouble(POSITION_PROFIT) +
+                      PositionGetDouble(POSITION_SWAP);
+         }
+      }
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| OUTER GRID PRICE (BUY: lowest open | SELL: highest open)         |
+//+------------------------------------------------------------------+
+double GetOuterGridPrice(ENUM_POSITION_TYPE type)
+{
+   double price = 0;
+   bool found = false;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == type)
+         {
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(!found) { price = openPrice; found = true; }
+            else
+            {
+               if(type == POSITION_TYPE_BUY && openPrice < price) price = openPrice;
+               else if(type == POSITION_TYPE_SELL && openPrice > price) price = openPrice;
+            }
+         }
+      }
+   }
+   return price;
+}
+
+//+------------------------------------------------------------------+
+//| INCREMENTAL GRID DISTANCE (points required for the next add)     |
+//+------------------------------------------------------------------+
+int GetIncrementalGridDistance()
+{
+   int gridCount = (currentDirection == 0)
+                   ? CountGridPositions(POSITION_TYPE_BUY)
+                   : CountGridPositions(POSITION_TYPE_SELL);
+   return BaseGridDistance + (gridCount * GridIncrementStep);
+}
+
+//+------------------------------------------------------------------+
+//| ENGINE STATE / DIRECTION                                         |
+//+------------------------------------------------------------------+
+void ResetEngine()
+{
+   gridPeakProfit = 0.0;
+   closeAllPending = false;
+   closeAfterLoss = false;
+}
+
+void SwitchDirection()
+{
+   currentDirection = (currentDirection == 0) ? 1 : 0;
+   Print("D2 DIRECTION SWITCHED to: ", (currentDirection == 0) ? "BUY" : "SELL");
+}
+
+void RequestCloseAll(bool lossMode, double lossAmount = 0.0)
+{
+   closeAllPending = true;
+   closeAfterLoss = lossMode;
+   lastStopLossAmount = lossAmount;
+}
+
+//+------------------------------------------------------------------+
+//| PROCESS CLOSE ALL                                                |
+//+------------------------------------------------------------------+
+void ProcessCloseAll()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      trade.PositionClose(ticket);
+   }
+
+   if(TotalOurPositions() == 0)
+   {
+      bool wasLossClose = closeAfterLoss;
+      double lossAmount = lastStopLossAmount;
+
+      if(balanceBeforeClose > 0)
+      {
+         double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+         double realizedProfit = currentBalance - balanceBeforeClose;
+         dayNetProfit += realizedProfit;
+         Print("D2 REALIZED P/L: $", DoubleToString(realizedProfit, 2),
+               " | Day Net: $", DoubleToString(dayNetProfit, 2));
+         balanceBeforeClose = 0.0;
+      }
+      else
+      {
+         Print("D2 WARNING: balanceBeforeClose not set, skipping day profit update");
+      }
+
+      SwitchDirection();   // ALWAYS switch after a close
+      ResetEngine();
+
+      if(wasLossClose && lossAmount > 0)
+      {
+         int pauseMinutes = GetPauseDurationMinutes(lossAmount);
+         if(pauseMinutes > 0)
+         {
+            pauseUntil = TimeCurrent() + (pauseMinutes * 60);
+            Print("D2 PAUSE ACTIVATED: ", pauseMinutes, " min after stop loss of $",
+                  DoubleToString(lossAmount, 2));
+         }
+         else pauseUntil = 0;
+      }
+      else pauseUntil = 0;
+
+      closeAllPending = false;
+      closeAfterLoss = false;
+      lastStopLossAmount = 0.0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OPEN FIRST TRADE (set 0 = always 1 x LotSize)                    |
+//+------------------------------------------------------------------+
+void OpenFirstTrade()
+{
+   if(!AllowTrading()) return;
+   if(!CanOpenNewTrades()) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lot = GetNextLot(0);   // count 0 -> 1 unit in all modes
+
+   bool result = false;
+   if(currentDirection == 0)
+      result = trade.Buy(lot, _Symbol, ask, 0, 0, "D2_GridBuy");
+   else
+      result = trade.Sell(lot, _Symbol, bid, 0, 0, "D2_GridSell");
+
+   if(result)
+      Print("D2 FIRST TRADE: ", (currentDirection == 0) ? "BUY" : "SELL",
+            " ", DoubleToString(lot, 2), " lots");
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE GRID (add the next set with its lot size)                 |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   if(!AllowTrading()) return;
+   if(!CanOpenNewTrades()) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int requiredDistance = GetIncrementalGridDistance();
+
+   if(currentDirection == 0)  // BUY GRID
+   {
+      int count = CountGridPositions(POSITION_TYPE_BUY);
+      if(count >= MaxTrades) return;
+
+      double outer = GetOuterGridPrice(POSITION_TYPE_BUY);
+      double distance = (outer - bid) / _Point;
+      if(distance >= requiredDistance)
+         trade.Buy(GetNextLot(count), _Symbol, ask, 0, 0, "D2_GridBuy");
+   }
+   else  // SELL GRID
+   {
+      int count = CountGridPositions(POSITION_TYPE_SELL);
+      if(count >= MaxTrades) return;
+
+      double outer = GetOuterGridPrice(POSITION_TYPE_SELL);
+      double distance = (ask - outer) / _Point;
+      if(distance >= requiredDistance)
+         trade.Sell(GetNextLot(count), _Symbol, bid, 0, 0, "D2_GridSell");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD                                                        |
+//+------------------------------------------------------------------+
+void Dashboard()
+{
+   double gridProfit = GetGridProfit();
+   double activeStop = GetActiveStopLoss();
+   double effectiveTarget = GetEffectiveDailyTarget();
+   int    gridCount  = TotalOurPositions();
+
+   string pauseStatus = "NO";
+   if(pauseUntil > 0 && TimeCurrent() < pauseUntil)
+   {
+      int remainingSecs = (int)(pauseUntil - TimeCurrent());
+      pauseStatus = "YES (" + IntegerToString(remainingSecs / 60) + "m " +
+                    IntegerToString(remainingSecs % 60) + "s)";
+   }
+
+   string lm = (LotMode == LOT_DOUBLING) ? "DOUBLING" : (LotMode == LOT_INCREMENTAL ? "INCR" : "FLAT");
+   string stopSrc = (FixedStopLossAbs > 0) ? "ABS $" + DoubleToString(FixedStopLossAbs,0) : "DYNAMIC";
+   string trailStatus = (gridPeakProfit >= GetGridTrailStart()) ? "ACTIVE" : "Waiting";
+   string trailLevelStr = (trailStatus == "ACTIVE") ? ("$" + DoubleToString(GetTrailCloseLevel(), 2)) : "N/A";
+
+   string dash = "=== D2: double-lot / abs-stop grid (" + DoubleToString(GetLotMultiplier(), 2) + "x) ===";
+   dash += "\nLotMode: " + lm + " | NextLot: " + DoubleToString(GetNextLot(gridCount), 2);
+
+   dash += "\n\n-- GRID --";
+   dash += "\nLot: " + DoubleToString(LotSize, 2) + " | Sets: " + IntegerToString(gridCount) + "/" + IntegerToString(MaxTrades);
+   dash += " | Dir: " + ((currentDirection == 0) ? "BUY" : "SELL");
+   dash += " | NextDist: " + IntegerToString(GetIncrementalGridDistance()) + "pts";
+
+   dash += "\n\n-- P/L --";
+   dash += "\nGrid: $" + DoubleToString(gridProfit, 2) + " | Day: $" + DoubleToString(dayNetProfit, 2);
+
+   dash += "\n\n-- TRAIL --";
+   dash += "\nPeak: $" + DoubleToString(gridPeakProfit, 2) + " | Start: $" + DoubleToString(GetGridTrailStart(), 2);
+   dash += "\nStep: $" + DoubleToString(GetDynamicTrailStep(), 2) + " | Floor: $" + DoubleToString(GetMinTrailProfit(), 2);
+   dash += "\nStatus: " + trailStatus + " | Close@: " + trailLevelStr;
+
+   dash += "\n\n-- STOP --";
+   dash += "\nActive: $" + DoubleToString(activeStop, 2) + " | Source: " + stopSrc;
+
+   dash += "\n\n-- DAILY --";
+   dash += "\nTarget: $" + DoubleToString(effectiveTarget, 2) +
+           " | LossLimit: $" + DoubleToString(GetDailyLossLimit(), 2);
+
+   dash += "\n\n-- STATUS --";
+   dash += "\nPause: " + pauseStatus + " | Market: " + (IsMarketOpen() ? "OPEN" : "CLOSED");
+
+   Comment(dash);
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT TICK FUNCTION                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   CheckDayReset();
+   CheckLossThresholds();
+
+   if(closeAllPending)
+   {
+      ProcessCloseAll();
+      Dashboard();
+      return;
+   }
+
+   if(pauseUntil > 0 && TimeCurrent() < pauseUntil)
+   {
+      Dashboard();
+      return;
+   }
+
+   int totalPositions = TotalOurPositions();
+
+   // STEP 1: manage open basket
+   if(totalPositions > 0)
+   {
+      double gridProfit = GetGridProfit();
+
+      if(gridProfit > gridPeakProfit)
+         gridPeakProfit = gridProfit;
+
+      // STOP LOSS first (absolute $ cap by default)
+      double currentStopLoss = GetActiveStopLoss();
+      if(gridProfit <= -currentStopLoss)
+      {
+         Print("D2 STOP LOSS: GridProfit=$", DoubleToString(gridProfit, 2),
+               " | Stop=$", DoubleToString(currentStopLoss, 2),
+               " | Day Before=$", DoubleToString(dayNetProfit, 2));
+
+         balanceBeforeClose = AccountInfoDouble(ACCOUNT_BALANCE);
+         RequestCloseAll(true, currentStopLoss);
+         Dashboard();
+         return;
+      }
+
+      // TRAILING STOP (no fixed profit target)
+      if(gridPeakProfit >= GetGridTrailStart())
+      {
+         double trailCloseLevel = GetTrailCloseLevel();
+         if(gridProfit <= trailCloseLevel)
+         {
+            Print("D2 TRAILING STOP: Peak=$", DoubleToString(gridPeakProfit, 2),
+                  " | Current=$", DoubleToString(gridProfit, 2),
+                  " | Close@=$", DoubleToString(trailCloseLevel, 2));
+
+            balanceBeforeClose = AccountInfoDouble(ACCOUNT_BALANCE);
+            RequestCloseAll(false);
+            Dashboard();
+            return;
+         }
+      }
+
+      ManageGrid();
+      Dashboard();
+      return;
+   }
+
+   // STEP 2: no positions -> open the first
+   if(totalPositions == 0)
+   {
+      if(CanOpenNewTrades() && AllowTrading())
+         OpenFirstTrade();
+      Dashboard();
+      return;
+   }
+
+   Dashboard();
+}
+//+------------------------------------------------------------------+
