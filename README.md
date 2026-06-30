@@ -62,6 +62,7 @@ Each file follows the pattern: `{Series}{Number}_{strategy-type}_{features}.mq5`
 | File | Grid Type | Lots | Max Levels | Stop Loss | Trailing | Notes |
 |------|-----------|------|------------|-----------|----------|-------|
 | **D1_incr300_2lvl_geostop** | Incremental 300/300 | Incremental (1,2 → 3-lot basket) | 2 | Geometric: 5pts before the 3rd set once full; dynamic $ SL while filling | Yes | The `incrLOT_300_2lvl` config from the 32-day backtest research |
+| **D2_double001_abs75_trail** | Incremental 0/300 | Doubling (1,2,4 → 3 sets open) | 4 (cap; stop limits to 3) | **Absolute $75** per-basket (hard cap, not lot-scaled) | Yes | Small-stake, hard-capped "many small wins" redesign; max loss −$75 |
 
 **NEW:** D1 is the **`incrLOT_300_2lvl`** strategy from the backtest research, ported 1:1 from the Python
 simulator (`bt_b10_sim.py`). It is the B10 engine (trailing exit, daily limits, auto-scaling, 24/7,
@@ -115,6 +116,58 @@ loss tail. Size for the bad-basket day, not the median:
   `PERDAY_ANALYSIS.md`.
 - **Smaller tail:** set `IncrementalLots=false` for `flatLOT_300_2lvl` — nearly the same median, smaller
   tail (~−$869 vs −$921); best risk-adjusted of the two.
+
+---
+
+**NEW:** D2 is the **small-stake, hard-capped redesign** of D1, built after D1's ~−$920 tail was judged
+too large ("losses take the profits and from my pocket"). Same B10 engine, but three changes: (1)
+**doubling lots** — set k opens 2ᵏ × LotSize (0.01, 0.02, 0.04…); (2) an **absolute $75 per-basket stop**
+that is NOT lot-scaled (the hard downside cap); and (3) grid **base=0 / incr=300** (sets at 0, −300, −900
+points). The geometry is deterministic: **exactly 3 sets open** before the $75 stop, which triggers
+~1671 points (~$16.71 of gold movement) from the first entry while holding 0.07 lots — a 4th set would
+imply an $84 loss > $75, so it never opens. The trailing was optimized over the 32-day data (sweep in
+`bt_d2_design.py`); `GridTrailStart=4.0, TrailStepBase=0.5` gave the best expectancy. **Honest verdict:**
+median ~+$21/day, ~75% win rate, worst day ~−$85, but **mean ≈ breakeven (−$0.20/day)** — D2 controls the
+tail far better than D1 (worst −$85 vs −$920) but is a **risk-controlled config, not a proven profit
+engine.** Forward-validate on demo before sizing up.
+
+#### D2 Recommended Input Values
+
+The shipped defaults **already are** the computed + optimized config. Unlike D1, the trailing values here
+are **deliberately set as-is** (not `0`/auto), because the sweep found a specific optimum for the 0.01-lot
+scale — leave them as shown.
+
+| Input | Value | Why |
+|-------|-------|-----|
+| `LotSize` | **0.01** | Small-stake base; set 0 = 1 unit |
+| `MaxTrades` | **4** | Safety cap only — the $75 stop is the real limiter (→ 3 sets open) |
+| `BaseGridDistance` | **0** | First gap = 1× increment; gives sets at 0/−300/−900 pts |
+| `GridIncrementStep` | **300** | Incremental spacing (gaps grow 300, 600, 900…) |
+| `LotMode` | **LOT_DOUBLING** | Sets open 0.01 → 0.02 → 0.04 (the "2X and so on" rule) |
+| `FixedStopLossAbs` | **75** | Hard absolute −$75 cap per basket (NOT lot-scaled) |
+| `GridTrailStart` | **4.0** | Swept optimum — start trailing at $4 basket profit |
+| `TrailStepBase` | **0.5** | Swept optimum — tightest give-back, best expectancy |
+| `TrailStepMultiplier` | **0.45** | = step × 0.9, as swept |
+| `MinTrailProfit` | **1.0** | Locked-profit floor once trailing active |
+| `DailyTarget` | **0** | 0 = auto ($20 at 0.01 lot) |
+| `DailyLossLimit` | **0** | 0 = auto ($50 at 0.01 lot) — circuit breaker |
+| `PauseMinutesAfterMarketOpen` | **0** | Backtest was 24/7, no time filter |
+| `PauseMinutesBeforeMarketClose` | **0** | Same |
+| `MagicNumber` | **100302** | Keep distinct from B10 (101010) and D1 (100301) |
+| `Slippage` | **30** | As-is |
+
+**Deterministic geometry (computed, not tuned):**
+
+| Set | Opens at | Lot | Cumulative lots | Basket loss there |
+|-----|----------|-----|-----------------|-------------------|
+| 1 | market | 0.01 | 0.01 | $0 |
+| 2 | −300 pts | 0.02 | 0.03 | $3 |
+| 3 | −900 pts | 0.04 | 0.07 | $21 |
+| ~~4~~ | ~~−1800 pts~~ | ~~0.08~~ | — | $84 → **blocked by $75 stop** |
+
+**D1 vs D2 — pick by risk appetite:** D1 = bigger median (~+$200/day at 0.1 lot) but a −$920 tail; D2 =
+tiny median (~+$21/day) with a hard −$85 worst day and ~breakeven mean. D2 is the safer "many small
+wins, capped loss" choice you asked for; D1 is higher-variance. Both need forward-demo validation.
 
 **NEW (V8):** B10 includes **dynamic stop loss**, **daily limits**, and **24/7 trading** - see section below.
 
